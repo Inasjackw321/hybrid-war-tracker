@@ -185,7 +185,7 @@ def main(argv=None) -> int:
 
     s = sub.add_parser("scan", help="find flagged aircraft now")
     common(s)
-    s.add_argument("--squawks", default=",".join(classify.SQUAWKS), help="squawk codes to look for (default: all, 7500,7600,7700,7400,7777)")
+    s.add_argument("--squawks", default=",".join(classify.DEFAULT_SQUAWKS), help="squawk codes to look for (default 7500,7600,7700; 7400 and 7777 also work)")
     s.add_argument("--sources", default=",".join(DEFAULT_SOURCES), help="ADS-B APIs: adsb.lol,airplanes.live,adsb.fi")
     s.add_argument("--acars-file", action="append", help="JSON lines from acarsdec/dumpvdl2/dumphfdl/ACARS Hub (repeatable)")
     s.add_argument("--airframes", action="store_true", help="also pull ACARS from airframes.io (needs AIRFRAMES_API_KEY)")

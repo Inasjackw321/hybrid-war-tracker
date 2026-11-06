@@ -320,7 +320,7 @@ class LiveAppTests(unittest.TestCase):
             self.assertTrue((Path(d) / "cards" / "overview.png").exists())
             live = json.loads((Path(d) / "data" / "live.json").read_text())
             self.assertEqual(live["alerts"][0]["category"], "emergency")
-            self.assertEqual(live["squawks"], ["7500", "7600", "7700", "7400", "7777"])
+            self.assertEqual(live["squawks"], ["7500", "7600", "7700"])  # general emergencies only by default
             with (Path(d) / "data" / "alerts.csv").open() as fh:
                 self.assertEqual(len(list(csv.DictReader(fh))), 1)  # same alert, logged once
 
@@ -407,3 +407,35 @@ class NetworkFailureTests(unittest.TestCase):
             status = app.cycle()
         self.assertEqual(status["phase"], "offline")
         self.assertIn("feeds", status["message"])
+
+
+class ControlTests(unittest.TestCase):
+    def test_dashboard_buttons_and_stop(self):
+        import socket
+        import urllib.error
+        import urllib.request
+
+        from plane_watch.app import LiveApp, parser, running_instance, send_control, start_server
+
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        with tempfile.TemporaryDirectory() as d:
+            app = LiveApp(parser().parse_args(["--out", d, "--udp-port", "0", "--no-browser"]))
+            env = {k: v for k, v in os.environ.items() if k != "PLANE_WATCH_OFFLINE"}
+            with mock.patch.dict(os.environ, env, clear=True):
+                got = start_server(Path(d), port, app)
+                self.assertTrue(running_instance(got))
+                # without the header (what another website could send) nothing happens
+                req = urllib.request.Request(f"http://127.0.0.1:{got}/api/stop", data=b"", method="POST")
+                with self.assertRaises(urllib.error.HTTPError):
+                    urllib.request.urlopen(req, timeout=5)
+                self.assertFalse(app.stopping.is_set())
+                self.assertTrue(send_control(got, "pause"))
+                self.assertTrue(app.paused.is_set())
+                self.assertTrue(json.loads((Path(d) / "data" / "live.json").read_text())["paused"])
+                self.assertTrue(send_control(got, "resume"))
+                self.assertFalse(app.paused.is_set())
+                self.assertTrue(send_control(got, "stop"))
+                self.assertTrue(app.stopping.is_set())
+                self.assertEqual(json.loads((Path(d) / "data" / "live.json").read_text())["phase"], "stopped")

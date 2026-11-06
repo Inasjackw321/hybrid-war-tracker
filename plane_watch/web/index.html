@@ -34,6 +34,14 @@
   .sub { color: var(--muted); font-size: 13px; }
   .status { margin-left: auto; display: flex; align-items: center; gap: 10px; color: var(--muted); font-size: 13px;
     background: var(--glass2); padding: 8px 14px; border-radius: 999px; }
+  .controls { display: flex; gap: 6px; }
+  .ctl { border: 0; font: inherit; font-size: 13px; font-weight: 600; color: var(--text); background: rgba(255, 255, 255, .06);
+    padding: 8px 14px; border-radius: 999px; cursor: pointer; transition: background .2s, opacity .2s; }
+  .ctl:hover { background: rgba(255, 255, 255, .12); }
+  .ctl:disabled { opacity: .35; cursor: default; }
+  .ctl.danger:hover { background: rgba(255, 69, 58, .22); color: #ff8a80; }
+  .ctl.on { background: rgba(255, 214, 10, .18); color: var(--warn); }
+  .dot.paused { background: var(--warn); }
   .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--faint); box-shadow: 0 0 0 0 currentColor; }
   .dot.ok { background: var(--ok); color: rgba(48, 209, 88, .5); animation: pulse 2.4s infinite; }
   .dot.warn { background: var(--warn); color: rgba(255, 214, 10, .5); animation: pulse 2.4s infinite; }
@@ -103,9 +111,14 @@
     <div class="logo"><svg width="20" height="20" viewBox="-1 -1 2 2" aria-hidden="true"><path fill="#ff3b30" transform="rotate(45)" d="M0-1 .08-.86.09-.32.92.04.92.17.09-.03.07.55.34.76.34.87 0 .78-.34.87-.34.76-.07.55-.09-.03-.92.17-.92.04-.09-.32-.08-.86Z"/></svg></div>
     <div>
       <h1>Plane Watch</h1>
-      <div class="sub">Squawks 7500 · 7600 · 7700 · 7400 · 7777, military emergencies, ACARS threats</div>
+      <div class="sub" id="subtitle">Emergency squawks 7500 · 7600 · 7700, transponder emergencies, ACARS threats</div>
     </div>
     <div class="status"><span class="dot" id="dot"></span><span id="status-text">Starting…</span></div>
+    <div class="controls">
+      <button class="ctl" id="btn-pause" title="Stop checking until you press Resume">Pause</button>
+      <button class="ctl" id="btn-check" title="Check the feeds right now">Check now</button>
+      <button class="ctl danger" id="btn-stop" title="Shut Plane Watch down">Stop</button>
+    </div>
   </div>
 </header>
 
@@ -135,7 +148,7 @@ const COLORS = {hijack:"#ff2d55", bomb:"#ff2d55", downed:"#ff2d55", security:"#f
   intercept:"#64d2ff", watch:"#5ac8a8"};
 const $ = id => document.getElementById(id);
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
-let live = null, lastTs = 0, filter = null, history = {}, prog = {};
+let live = null, lastTs = 0, filter = null, history = {}, prog = {}, alive = true, stopped = false;
 
 function ago(ts) { const s = Math.round(Date.now() / 1000 - ts); return s < 60 ? `${s}s ago` : `${Math.round(s / 60)} min ago`; }
 
@@ -143,17 +156,42 @@ function tick() {
   if (!live) return;
   const now = Date.now() / 1000, next = Math.max(0, Math.round(live.next_update_ts - now));
   const checking = prog.checking && now - prog.ts < 120;
-  const heartbeat = Math.max(live.updated_ts, prog.ts || 0);
-  const stale = now - heartbeat > Math.max(180, live.interval_s * 3);
   const p = checking && prog.message ? prog.message : "";
-  let text;
-  if (stale) text = `No update for ${ago(heartbeat).replace(" ago", "")}. Is the app still running?`;
-  else if (live.phase === "starting") text = p || "Checking the feeds for the first time…";
-  else text = `Updated ${ago(live.updated_ts)} · ` + (checking ? (p || "checking now…") : next > 0 ? `next check in ${next}s` : "checking now…");
-  $("dot").className = "dot " + (stale || live.phase === "error" || live.phase === "offline" ? "stale" : live.errors.length ? "warn" : "ok");
+  let text, dot;
+  if (!alive || stopped || live.phase === "stopped") {
+    text = "Plane Watch isn't running. Start it again with Start Plane Watch (or python planewatch.py).";
+    dot = "stale";
+  } else if (live.paused) {
+    text = "Paused · press Resume to start checking again"; dot = "paused";
+  } else if (live.phase === "starting") {
+    text = p || "Checking the feeds for the first time…"; dot = "ok";
+  } else {
+    text = `Updated ${ago(live.updated_ts)} · ` + (checking ? (p || "checking now…") : next > 0 ? `next check in ${next}s` : "checking now…");
+    dot = live.phase === "error" || live.phase === "offline" ? "stale" : live.errors.length ? "warn" : "ok";
+  }
+  $("dot").className = "dot " + dot;
   $("status-text").textContent = text;
   const pl = $("progress-line"); if (pl) pl.textContent = p;
+  const off = !alive || stopped || live.phase === "stopped";
+  $("btn-pause").textContent = live.paused ? "Resume" : "Pause";
+  $("btn-pause").classList.toggle("on", !!live.paused);
+  ["btn-pause", "btn-check", "btn-stop"].forEach(id => $(id).disabled = off);
+  $("btn-check").disabled = off || !!live.paused || checking;
 }
+
+async function control(action) {
+  try {
+    const r = await fetch("api/" + action, {method: "POST", headers: {"X-PlaneWatch": "1"}});
+    if (!r.ok) throw new Error(r.status);
+    if (action === "stop") stopped = true;
+    if (action === "pause" || action === "resume") live.paused = action === "pause";
+    if (action === "check") prog = {checking: true, ts: Date.now() / 1000, message: "checking now…"};
+  } catch { alive = false; }
+  tick(); setTimeout(poll, 800);
+}
+$("btn-pause").onclick = () => control(live && live.paused ? "resume" : "pause");
+$("btn-check").onclick = () => control("check");
+$("btn-stop").onclick = () => { if (confirm("Stop Plane Watch? It stops checking until you start it again.")) control("stop"); };
 
 function highlight(text, flags) {
   let out = esc(text);
@@ -187,7 +225,10 @@ function render() {
     Object.entries(counts).map(([c, n]) => `<button class="pill" style="--c:${COLORS[c]}" aria-pressed="${filter === c}" data-c="${c}">${esc(c)} ${n}</button>`).join("") : "";
   document.querySelectorAll(".pill").forEach(b => b.onclick = () => { filter = b.dataset.c || null; render(); });
   const shown = filter ? alerts.filter(a => a.category === filter) : alerts;
-  $("current").innerHTML = live.phase === "starting"
+  if (live.squawks) $("subtitle").textContent = `Emergency squawks ${live.squawks.join(" · ")}, transponder emergencies, ACARS threats`;
+  $("current").innerHTML = live.phase === "stopped"
+      ? `<div class="quiet"><strong>Plane Watch is stopped</strong>Start it again with <code>Start Plane Watch</code> or <code>python planewatch.py</code>. The cards and history are kept.</div>`
+    : live.phase === "starting"
       ? `<div class="quiet"><strong>Checking the feeds…</strong>The first check takes about 20–60 seconds. This page fills in by itself.<div class="meta" id="progress-line"></div></div>`
     : live.phase === "offline"
       ? `<div class="quiet"><strong>Can't reach the flight-tracking feeds</strong>${esc(live.message)}<div class="meta">Details are under Warnings below.</div></div>`
@@ -226,12 +267,14 @@ $("lightbox").onclick = () => $("lightbox").classList.remove("open");
 $("search").oninput = renderHistory;
 
 async function poll() {
+  try { const r = await fetch("api/ping", {cache: "no-store"}); alive = r.ok; if (r.ok) stopped = false; } catch { alive = false; }
+  if (!alive && live && live.phase !== "stopped") { live.phase = "stopped"; render(); }
   try { const r = await fetch("data/progress.json", {cache: "no-store"}); if (r.ok) prog = await r.json(); } catch {}
   try {
     const r = await fetch("data/live.json", {cache: "no-store"});
     if (r.ok) {
       const j = await r.json();
-      if (j.updated_ts !== lastTs) {
+      if (j.updated_ts !== lastTs || j.paused !== (live && live.paused) || j.phase !== (live && live.phase)) {
         live = j; lastTs = j.updated_ts; render();
         try { history = await (await fetch("data/history.json", {cache: "no-store"})).json(); delete history._acars_logged; renderHistory(); } catch {}
       }

@@ -36,7 +36,8 @@ from .sources import acars as acars_src
 from .sources import photos as photo_src
 from .sources.adsb import DEFAULT_SOURCES, AdsbClient
 
-ALL_SQUAWKS = tuple(classify.SQUAWKS)  # 7500, 7600, 7700, 7400, 7777
+DEFAULT_SQUAWKS = classify.DEFAULT_SQUAWKS  # 7500 hijack, 7600 radio failure, 7700 emergency
+CONTROL_HEADER = "X-PlaneWatch"  # other websites can't send this header without a CORS preflight we never answer
 FORGET_AFTER_S = 2 * 3600  # cleared aircraft stay in "recently cleared" this long
 
 
@@ -87,6 +88,10 @@ class AcarsListener:
 
 
 class QuietHandler(SimpleHTTPRequestHandler):
+    """Serves the dashboard files, plus a tiny control API for the dashboard buttons."""
+
+    app = None  # the LiveApp, set by start_server
+
     def log_message(self, *args):
         pass
 
@@ -94,16 +99,63 @@ class QuietHandler(SimpleHTTPRequestHandler):
         self.send_header("Cache-Control", "no-cache")
         super().end_headers()
 
+    def _json(self, code, obj):
+        body = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
-def start_server(directory: Path, port: int) -> int:
+    def do_GET(self):
+        if self.path.startswith("/api/ping"):
+            return self._json(200, {"app": "planewatch", "pid": os.getpid(), "paused": bool(self.app and self.app.paused.is_set())})
+        return super().do_GET()
+
+    def do_POST(self):
+        if not self.path.startswith("/api/") or self.app is None:
+            return self._json(404, {"error": "not found"})
+        if self.headers.get(CONTROL_HEADER) != "1":
+            return self._json(403, {"error": "missing header"})
+        action = self.path[len("/api/"):].split("?")[0]
+        if action not in ("pause", "resume", "check", "stop"):
+            return self._json(404, {"error": "unknown action"})
+        self.app.control(action)
+        return self._json(200, {"ok": True, "action": action})
+
+
+def start_server(directory: Path, port: int, app=None) -> int:
+    handler = type("Handler", (QuietHandler,), {"app": app})
     for p in range(port, port + 20):
         try:
-            server = ThreadingHTTPServer(("127.0.0.1", p), partial(QuietHandler, directory=str(directory)))
+            server = ThreadingHTTPServer(("127.0.0.1", p), partial(handler, directory=str(directory)))
         except OSError:
             continue
         threading.Thread(target=server.serve_forever, daemon=True).start()
         return p
     raise SystemExit(f"no free port between {port} and {port + 19}")
+
+
+def running_instance(port: int) -> bool:
+    """Is a Plane Watch already serving on this port?"""
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/ping", timeout=2) as r:
+            return json.loads(r.read()).get("app") == "planewatch"
+    except (OSError, ValueError):
+        return False
+
+
+def send_control(port: int, action: str) -> bool:
+    import urllib.request
+
+    req = urllib.request.Request(f"http://127.0.0.1:{port}/api/{action}", data=b"", method="POST", headers={CONTROL_HEADER: "1"})
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return r.status == 200
+    except OSError:
+        return False
 
 
 class LiveApp:
@@ -120,6 +172,11 @@ class LiveApp:
         self.logged_msgs = set(self.history.get("_acars_logged", []))
         self.history.pop("_acars_logged", None)
         self.locate_cache: dict[str, object] = {}
+        self.squawks = tuple(x.strip() for x in args.squawks.split(",") if x.strip())
+        self.paused = threading.Event()
+        self.wake = threading.Event()  # set to skip the wait (check now, resume, stop)
+        self.stopping = threading.Event()
+        self.last_status: dict | None = None
         self.client.on_progress = self.progress
         self._last_progress = 0.0
 
@@ -169,13 +226,13 @@ class LiveApp:
         self.progress("Reading ACARS…")
         msgs = self.acars()
         flagged = pipeline.flagged_messages(msgs)
-        aircraft = {ac.hex: ac for ac in self.client.squawks(ALL_SQUAWKS)}
+        aircraft = {ac.hex: ac for ac in self.client.squawks(self.squawks)}
         for ac in self.client.emergencies():
             aircraft.setdefault(ac.hex, ac)
 
         # ACARS-only aircraft: look each one up once, not every cycle
         client = _CachedLocator(self.client, self.locate_cache)
-        alerts = pipeline.build_alerts(list(aircraft.values()), flagged, client, ALL_SQUAWKS)
+        alerts = pipeline.build_alerts(list(aircraft.values()), flagged, client, self.squawks)
 
         now = time.time()
         current = []
@@ -223,7 +280,7 @@ class LiveApp:
             "updated_ts": now,
             "next_update_ts": started + self.args.interval,
             "interval_s": self.args.interval,
-            "squawks": list(ALL_SQUAWKS),
+            "squawks": list(self.squawks),
             "sources": self.client.sources,
             "acars": {
                 "messages": len(msgs), "flagged": len(flagged),
@@ -236,19 +293,42 @@ class LiveApp:
             "alerts": [self._summary(e, live=True) for e in sorted(current, key=lambda e: -classify.severity(e["alert"].top.category))],
             "cleared": [self._summary(e, live=False) for e in sorted(cleared, key=lambda e: -e["last_seen"])],
         }
+        status["paused"] = self.paused.is_set()
+        self.last_status = status
         self._write("live.json", status)
         self.progress("", checking=False)
         return status
+
+    def control(self, action: str):
+        """Called by the dashboard buttons (and --stop)."""
+        if action == "pause":
+            self.paused.set()
+            print("  paused (press Resume on the dashboard to continue)", flush=True)
+        elif action == "resume":
+            self.paused.clear()
+            print("  resumed", flush=True)
+        elif action == "stop":
+            self.stopping.set()
+        self._mark_paused()
+        self.wake.set()
+
+    def _mark_paused(self):
+        """Reflect pause/stop in live.json right away, without waiting for a check."""
+        status = dict(self.last_status or self._stub("starting", "Checking the feeds for the first time…"))
+        status["paused"] = self.paused.is_set()
+        if self.stopping.is_set():
+            status["phase"], status["message"] = "stopped", "Plane Watch was stopped."
+        self._write("live.json", status)
 
     def _stub(self, phase: str, message: str) -> dict:
         """A live.json for before the first check finishes (or when a check crashed)."""
         now = time.time()
         return {
             "phase": phase, "message": message, "updated_at": _iso(now), "updated_ts": now, "next_update_ts": now,
-            "interval_s": self.args.interval, "squawks": list(ALL_SQUAWKS), "sources": self.client.sources,
+            "interval_s": self.args.interval, "squawks": list(self.squawks), "sources": self.client.sources,
             "acars": {"messages": 0, "flagged": 0, "udp_port": self.args.udp_port if self.listener and not self.listener.error else None,
                       "udp_received": 0, "airframes": bool(os.environ.get("AIRFRAMES_API_KEY")), "files": self.args.acars_file or []},
-            "errors": list(self.client.errors), "alerts": [], "cleared": [],
+            "errors": list(self.client.errors), "alerts": [], "cleared": [], "paused": self.paused.is_set(),
         }
 
     def _carry_over(self, old: Alert, new: Alert):
@@ -324,39 +404,52 @@ class LiveApp:
     # ------------------------------------------------------------ run
 
     def run(self):
+        if running_instance(self.args.port):
+            url = f"http://localhost:{self.args.port}/"
+            print(f"  Plane Watch is already running: {url}")
+            if not self.args.no_browser:
+                webbrowser.open(url)
+            return 0
         web = files(__package__).joinpath("web", "index.html").read_text(encoding="utf-8")
         (self.out / "index.html").write_text(web, encoding="utf-8")
-        port = start_server(self.out, self.args.port)
+        port = start_server(self.out, self.args.port, self)
         url = f"http://localhost:{port}/"
         if self.listener:
             self.listener.start()
         self._write("live.json", self._stub("starting", "Checking the feeds for the first time…"))
         self.progress("Starting…")
         print(f"\n  PLANE WATCH  ·  dashboard: {url}")
-        print(f"  watching squawks {', '.join(ALL_SQUAWKS)} + military emergencies + ACARS threats")
+        print(f"  watching squawks {', '.join(self.squawks)} + transponder emergency status + ACARS threats")
         if self.listener and not self.listener.error:
             print(f"  ACARS: listening for decoder JSON on UDP port {self.args.udp_port}")
-        print(f"  saving to {self.out}   (Ctrl+C to stop)")
+        print(f"  saving to {self.out}")
+        print("  stop: Ctrl+C here, or the Stop button on the dashboard")
         print("  first check: about 20-60 seconds…\n", flush=True)
         if self.args.once:
             self._report(self.cycle())
             return 0
         if not self.args.no_browser:
             threading.Timer(1.0, lambda: webbrowser.open(url)).start()
-        while True:
+        while not self.stopping.is_set():
             t0 = time.time()
-            try:
-                self._report(self.cycle())
-            except Exception as e:  # noqa: BLE001 - keep the app alive through network hiccups
-                import traceback
+            if not self.paused.is_set():
+                try:
+                    self._report(self.cycle())
+                except Exception as e:  # noqa: BLE001 - keep the app alive through network hiccups
+                    import traceback
 
-                traceback.print_exc()
-                print(f"  ! check failed: {e}  (trying again in {self.args.interval:.0f}s)", file=sys.stderr)
-                stub = self._stub("error", f"The last check failed: {type(e).__name__}: {e}")
-                stub["next_update_ts"] = time.time() + self.args.interval
-                self._write("live.json", stub)
-                self.progress("", checking=False)
-            time.sleep(max(5, self.args.interval - (time.time() - t0)))
+                    traceback.print_exc()
+                    print(f"  ! check failed: {e}  (trying again in {self.args.interval:.0f}s)", file=sys.stderr)
+                    stub = self._stub("error", f"The last check failed: {type(e).__name__}: {e}")
+                    stub["next_update_ts"] = time.time() + self.args.interval
+                    self._write("live.json", stub)
+                    self.progress("", checking=False)
+            self.wake.clear()
+            self.wake.wait(timeout=None if self.paused.is_set() else max(5, self.args.interval - (time.time() - t0)))
+        self._mark_paused()
+        print("  stopped.", flush=True)
+        time.sleep(1.5)  # let the dashboard read the final status
+        return 0
 
     @staticmethod
     def _report(status: dict):
@@ -404,10 +497,14 @@ class _CachedLocator:
 
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        prog="planewatch", description="Watch for aircraft in trouble (every emergency squawk + ACARS threats) and show live cards.",
+        prog="planewatch", description="Watch for aircraft in an emergency (squawk 7500/7600/7700 + ACARS threats) and show live cards.",
         epilog="Other commands: demo (sample cards, offline), scan (one-off scan), render --hex X (card for any aircraft), "
                "classify TEXT (test the ACARS rules). Add --help after any of them.")
     p.add_argument("--out", default="planewatch-data", help="where cards and data are saved (default: ./planewatch-data)")
+    p.add_argument("--squawks", default=",".join(DEFAULT_SQUAWKS),
+                   help="squawk codes to watch (default 7500,7600,7700; 7400 and 7777 also work)")
+    p.add_argument("--background", action="store_true", help="keep running in the background with no terminal window")
+    p.add_argument("--stop", action="store_true", help="stop a Plane Watch that's running in the background")
     p.add_argument("--interval", type=float, default=60, help="seconds between checks (default 60)")
     p.add_argument("--port", type=int, default=8787, help="dashboard port (default 8787)")
     p.add_argument("--udp-port", type=int, default=5550, help="UDP port for ACARS decoder JSON (0 = off; default 5550)")
@@ -422,8 +519,70 @@ def parser() -> argparse.ArgumentParser:
     return p
 
 
+def _launch_command() -> list[str]:
+    """How to start this same app again in a new process."""
+    exe = sys.executable
+    if os.name == "nt":  # pythonw.exe runs without a console window
+        w = Path(exe).with_name("pythonw.exe")
+        exe = str(w) if w.exists() else exe
+    script = os.path.abspath(sys.argv[0]) if sys.argv and sys.argv[0] else ""
+    if script.endswith((".pyz", "planewatch.py")):
+        return [exe, script]
+    return [exe, "-m", "plane_watch"]
+
+
+def start_background(args, argv) -> int:
+    """Start a detached copy of the app, wait until its dashboard answers, open it, and return."""
+    import subprocess
+
+    url = f"http://localhost:{args.port}/"
+    if running_instance(args.port):
+        print(f"  Plane Watch is already running: {url}")
+        if not args.no_browser:
+            webbrowser.open(url)
+        return 0
+    out = Path(args.out).resolve()
+    out.mkdir(parents=True, exist_ok=True)
+    log = out / "planewatch.log"
+    child_args = [a for a in argv if a != "--background"] + ["--no-browser", "--out", str(out), "--_log", str(log)]
+    kw = {}
+    if os.name == "nt":
+        kw["creationflags"] = 0x00000008 | 0x00000200 | 0x08000000  # DETACHED_PROCESS | NEW_PROCESS_GROUP | NO_WINDOW
+    else:
+        kw["start_new_session"] = True
+    env = dict(os.environ)
+    pkg_parent = str(Path(__file__).resolve().parent.parent)
+    env["PYTHONPATH"] = pkg_parent + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+    subprocess.Popen(_launch_command() + child_args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, cwd=os.getcwd(), env=env, close_fds=True, **kw)
+    for _ in range(60):
+        time.sleep(0.5)
+        if running_instance(args.port):
+            print(f"  Plane Watch is running in the background: {url}")
+            print("  Stop it with the Stop button on the dashboard, or Stop Plane Watch.bat / --stop.")
+            if not args.no_browser:
+                webbrowser.open(url)
+            return 0
+    print(f"  Plane Watch didn't start. See {log}", file=sys.stderr)
+    return 1
+
+
 def main(argv=None) -> int:
-    args = parser().parse_args(argv)
+    argv = list(sys.argv[1:] if argv is None else argv)
+    p = parser()
+    p.add_argument("--_log", help=argparse.SUPPRESS)
+    args = p.parse_args(argv)
+    if args.stop:
+        if send_control(args.port, "stop"):
+            print("  Plane Watch stopped.")
+            return 0
+        print(f"  Plane Watch isn't running (nothing answered on port {args.port}).")
+        return 1
+    if args.background:
+        return start_background(args, argv)
+    if args._log:  # background copy: there's no console, so write everything to the log file
+        fh = open(args._log, "a", buffering=1, encoding="utf-8")  # noqa: SIM115 - lives as long as the process
+        sys.stdout = sys.stderr = fh
     try:
         return LiveApp(args).run() or 0
     except KeyboardInterrupt:

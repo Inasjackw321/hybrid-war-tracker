@@ -62,7 +62,18 @@ To run the tests: `python -m unittest`
 
 # Plane watch
 
-One app that watches for aircraft in trouble and draws a card for each one.
+One app that watches for aircraft in an emergency and draws a card for each one.
+
+## Start and stop it whenever you want
+
+On Windows, in the downloaded folder:
+
+- **Start Plane Watch.bat**: double-click it. Plane Watch runs in the background (no window to keep open) and the dashboard opens in your browser. If it's already running, this just opens the dashboard.
+- **Stop Plane Watch.bat**: double-click it to shut Plane Watch down.
+
+On macOS or Linux, use `start-planewatch.command` and `stop-planewatch.command`.
+
+The dashboard has buttons for the same things: **Pause** (stop checking until you press Resume), **Check now**, and **Stop**. Your cards and history stay in `planewatch-data/` between runs. When it runs in the background, its log is `planewatch-data/planewatch.log`.
 
 ## Run it: one command
 
@@ -83,7 +94,7 @@ You can also run `python planewatch.py` from a downloaded copy of this repo.
 
 It checks for all of these, every cycle:
 
-- **Every emergency squawk**: 7500 hijack, 7600 radio failure, 7700 emergency, 7400 drone lost link, 7777 US military intercept. It also reads the emergency status the transponder broadcasts, and checks the military feed for emergencies. Positions come from the free [adsb.lol](https://adsb.lol), [airplanes.live](https://airplanes.live) and [adsb.fi](https://adsb.fi) feeds.
+- **Emergency squawks**: 7500 hijack, 7600 radio failure, 7700 general emergency. It also reads the emergency status the transponder broadcasts (general, medical, low fuel, no radio, hijack, downed), including on military aircraft. 7400 (drone lost link) and 7777 (US military intercept) aren't watched by default; add them with `--squawks 7500,7600,7700,7400,7777`. Positions come from the free [adsb.lol](https://adsb.lol), [airplanes.live](https://airplanes.live) and [adsb.fi](https://adsb.fi) feeds.
 - **ACARS threats**: bomb threats, hijacking, security problems and unruly passengers, mayday/pan-pan, fire/smoke, engine or pressure failures, medical emergencies, low fuel, and **diversions**. When a message names the airport (`DIVERTING TO LBSF`), the card draws a line to it.
 - **Off-route aircraft**: a flagged aircraft more than 300 km off its planned route gets a *possible diversion* flag.
 
@@ -119,6 +130,9 @@ Everything goes in `planewatch-data/` (change it with `--out`):
 | Option | Default | |
 |---|---|---|
 | `--interval` | 60 | seconds between checks |
+| `--squawks` | 7500,7600,7700 | squawk codes to watch |
+| `--background` | | run with no terminal window (what Start Plane Watch.bat does) |
+| `--stop` | | stop a Plane Watch that's running in the background |
 | `--port` | 8787 | dashboard port |
 | `--udp-port` | 5550 | ACARS listener (0 turns it off) |
 | `--once` | | check once, save, and exit |
