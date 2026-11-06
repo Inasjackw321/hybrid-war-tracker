@@ -28,7 +28,7 @@ permissions:
   id-token: write
 
 concurrency:
-  group: social-scan
+  group: pages-site  # shared with plane-watch.yml so the two never deploy over each other
   cancel-in-progress: false
 
 jobs:
