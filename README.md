@@ -117,7 +117,8 @@ Everything goes in `planewatch-data/` (change it with `--out`):
 | File | What |
 |---|---|
 | `cards/<hex>.png` | the latest 1600×900 card for each flagged aircraft |
-| `cards/overview.png` | every flagged aircraft on one map |
+| `cards/overview.png` | the emergency map: aircraft in an emergency now, plus (dimmed) the ones from the last 6 hours |
+| `data/map_recent.json` | what the emergency map remembers, so it survives restarts |
 | `data/alerts.csv` | one row per alert, ready for a spreadsheet or pandas |
 | `data/history.json` | every alert seen, with first and last time seen |
 | `data/acars_flagged.jsonl` | every flagged ACARS message |
@@ -131,6 +132,7 @@ Everything goes in `planewatch-data/` (change it with `--out`):
 |---|---|---|
 | `--interval` | 60 | seconds between checks |
 | `--squawks` | 7500,7600,7700 | squawk codes to watch |
+| `--keep-hours` | 6 | how long an aircraft stays on the emergency map after its emergency ends |
 | `--background` | | run with no terminal window (what Start Plane Watch.bat does) |
 | `--stop` | | stop a Plane Watch that's running in the background |
 | `--port` | 8787 | dashboard port |

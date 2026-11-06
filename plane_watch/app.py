@@ -38,7 +38,6 @@ from .sources.adsb import DEFAULT_SOURCES, AdsbClient
 
 DEFAULT_SQUAWKS = classify.DEFAULT_SQUAWKS  # 7500 hijack, 7600 radio failure, 7700 emergency
 CONTROL_HEADER = "X-PlaneWatch"  # other websites can't send this header without a CORS preflight we never answer
-FORGET_AFTER_S = 2 * 3600  # cleared aircraft stay in "recently cleared" this long
 
 
 def _iso(ts: float | None) -> str:
@@ -172,6 +171,7 @@ class LiveApp:
         self.logged_msgs = set(self.history.get("_acars_logged", []))
         self.history.pop("_acars_logged", None)
         self.locate_cache: dict[str, object] = {}
+        self.map_recent: dict[str, dict] = self._load("map_recent.json", {})
         self.squawks = tuple(x.strip() for x in args.squawks.split(",") if x.strip())
         self.paused = threading.Event()
         self.wake = threading.Event()  # set to skip the wait (check now, resume, stop)
@@ -263,12 +263,22 @@ class LiveApp:
             current.append(entry)
 
         live_hex = {a.aircraft.hex for a in alerts}
-        cleared = [e for h, e in self.known.items() if h not in live_hex]
-        for h in [h for h, e in self.known.items() if h not in live_hex and now - e["last_seen"] > FORGET_AFTER_S]:
+        keep_s = self.args.keep_hours * 3600
+        for h in [h for h, e in self.known.items() if h not in live_hex and now - e["last_seen"] > keep_s]:
             del self.known[h]
+        cleared = [e for h, e in self.known.items() if h not in live_hex]
 
-        self.progress("Drawing the overview map")
-        render.render_overview(alerts, self.out / "cards" / "overview.png", title=self.args.title, brand=self.args.brand)
+        # emergency map: remember every aircraft that was in an emergency for keep_hours, even across restarts
+        for a in alerts:
+            if classify.is_emergency(a) and a.aircraft.lat is not None:
+                item = render.map_item(a)
+                item["seen_wall"] = now
+                self.map_recent[a.aircraft.hex] = item
+        self.map_recent = {h: i for h, i in self.map_recent.items() if now - i.get("seen_wall", 0) <= keep_s}
+        self._write("map_recent.json", self.map_recent)
+        self.progress("Drawing the emergency map")
+        render.render_overview(alerts, self.out / "cards" / "overview.png", title=self.args.title, brand=self.args.brand,
+                               earlier=list(self.map_recent.values()), keep_hours=self.args.keep_hours)
         self._record(alerts, flagged, now)
         feeds_ok = self.client.ok_requests > 0
         status = {
@@ -503,6 +513,8 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--out", default="planewatch-data", help="where cards and data are saved (default: ./planewatch-data)")
     p.add_argument("--squawks", default=",".join(DEFAULT_SQUAWKS),
                    help="squawk codes to watch (default 7500,7600,7700; 7400 and 7777 also work)")
+    p.add_argument("--keep-hours", type=float, default=6,
+                   help="keep aircraft on the emergency map (dimmed) this long after their emergency ends (default 6)")
     p.add_argument("--background", action="store_true", help="keep running in the background with no terminal window")
     p.add_argument("--stop", action="store_true", help="stop a Plane Watch that's running in the background")
     p.add_argument("--interval", type=float, default=60, help="seconds between checks (default 60)")

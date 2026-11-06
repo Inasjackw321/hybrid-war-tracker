@@ -141,3 +141,19 @@ def excerpt(text: str, matched: str, width: int = 140) -> str:
     start = max(0, i - width // 3)
     end = min(len(flat), start + width)
     return ("…" if start else "") + flat[start:end] + ("…" if end < len(flat) else "")
+
+
+# What goes on the overview map: the transponder says emergency, or ACARS says something critical.
+EMERGENCY_SQUAWK_CATEGORIES = {"hijack", "radio", "emergency"}  # 7500, 7600, 7700
+EMERGENCY_ACARS_CATEGORIES = {"hijack", "bomb", "emergency", "fire", "downed"}
+
+
+def is_emergency(alert) -> bool:
+    for f in alert.flags:
+        if f.origin == "squawk" and f.category in EMERGENCY_SQUAWK_CATEGORIES:
+            return True
+        if f.origin == "adsb-emergency":
+            return True
+        if f.origin == "acars" and f.category in EMERGENCY_ACARS_CATEGORIES:
+            return True
+    return False

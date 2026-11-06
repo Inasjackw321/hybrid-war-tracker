@@ -330,6 +330,14 @@ class LiveAppTests(unittest.TestCase):
                 s3 = app.cycle()
             self.assertEqual(s3["alerts"], [])
             self.assertEqual(s3["cleared"][0]["aircraft"]["hex"], "A1B2C3")
+            # ...and stays on the emergency map, even after a restart
+            self.assertIn("A1B2C3", app.map_recent)
+            self.assertIn("A1B2C3", LiveApp(self._args(d)).map_recent)
+            # until keep_hours has passed
+            app.args.keep_hours = 0
+            with mock.patch.object(adsb.http, "get_json", return_value={"now": READSB["now"], "ac": []}):
+                app.cycle()
+            self.assertEqual(app.map_recent, {})
 
     def test_udp_listener_parses_decoder_json(self):
         import socket
@@ -439,3 +447,23 @@ class ControlTests(unittest.TestCase):
                 self.assertTrue(send_control(got, "stop"))
                 self.assertTrue(app.stopping.is_set())
                 self.assertEqual(json.loads((Path(d) / "data" / "live.json").read_text())["phase"], "stopped")
+
+
+class EmergencyMapTests(unittest.TestCase):
+    def test_only_emergencies_count(self):
+        def alert(*flags):
+            return Alert(Aircraft("ABC123"), [Flag(c, "x", o) for c, o in flags])
+
+        self.assertTrue(classify.is_emergency(alert(("emergency", "squawk"))))
+        self.assertTrue(classify.is_emergency(alert(("radio", "squawk"))))
+        self.assertTrue(classify.is_emergency(alert(("fuel", "adsb-emergency"))))
+        self.assertTrue(classify.is_emergency(alert(("bomb", "acars"))))
+        self.assertFalse(classify.is_emergency(alert(("diversion", "acars"), ("medical", "acars"))))
+        self.assertFalse(classify.is_emergency(alert(("intercept", "squawk"))))  # 7777 isn't an emergency
+        self.assertFalse(classify.is_emergency(alert(("diversion", "route"))))
+
+    def test_map_item_is_compact(self):
+        a = sample_alerts()[0]
+        item = __import__("plane_watch.render", fromlist=["map_item"]).map_item(a)
+        self.assertLessEqual(len(item["track"]), 201)
+        self.assertEqual(item["track"][-1][:2], [round(a.aircraft.track[-1].lon, 3), round(a.aircraft.track[-1].lat, 3)])

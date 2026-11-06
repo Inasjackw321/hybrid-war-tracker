@@ -674,43 +674,115 @@ def render_card(alert: Alert, path, photo_bytes: bytes | None = None, title: str
     return path
 
 
-def render_overview(alerts: list[Alert], path, title: str = "PLANE ALERT", brand: str = "plane watch",
-                    when_ts: float | None = None, sample: bool = False):
-    """One picture of every current alert: list on the left, glowing markers on a world map."""
-    card = Card(title, brand)
-    worst = max(alerts, key=lambda a: CATEGORIES[a.top.category]["severity"]) if alerts else None
-    accent = CATEGORIES[worst.top.category]["color"] if worst else "#5ac8a8"
-    when_ts = when_ts or max((a.aircraft.seen_ts or 0 for a in alerts), default=0) or datetime.now(timezone.utc).timestamp()
-    when = datetime.fromtimestamp(when_ts, timezone.utc).strftime("%d %b %Y · %H:%M UTC")
-    card.chrome(accent, f"{len(alerts)} flagged aircraft · position: ADS-B community feeds · map: Natural Earth · {brand}", when, sample)
-    card.pill(15, 54, f"{len(alerts)} ACTIVE ALERT{'S' if len(alerts) != 1 else ''}", 6.3, "#0b0d10", accent)
-    y = 82
-    ranked = sorted(alerts, key=lambda a: -CATEGORIES[a.top.category]["severity"])
-    for a in ranked[:16]:
-        cat = CATEGORIES[a.top.category]
-        card.ov.plot([16], [y - 3], "o", ms=4 * PT, color=cat["color"], mew=0, zorder=6)
-        card.ov.plot([16], [y - 3], "o", ms=9 * PT, color=cat["color"], alpha=0.18, mew=0, zorder=6)
-        card.text(25, y, a.aircraft.label, px=7.6, weight="bold")
-        card.text(PANEL_W - 12, y, textwrap.shorten(cat["label"], 22, placeholder="…"), px=5.5, color=cat["color"], ha="right", weight="bold")
-        card.text(25, y + 9, textwrap.shorten(nice_desc(a.aircraft.description or a.aircraft.type_code or a.aircraft.hex), 36, placeholder="…"),
-                  px=5.6, color=C["muted"])
-        y += 21
-    if len(ranked) > 16:
-        card.text(25, y, f"+ {len(ranked) - 16} more", px=6, color=C["muted"])
-    if not alerts:
-        card.text(15, 84, "Nothing flagged right now.", px=7, color=C["muted"])
+def map_item(alert: Alert) -> dict:
+    """What the overview map needs to remember about an aircraft (small enough to keep for hours)."""
+    ac = alert.aircraft
+    track = ac.track
+    step = max(1, math.ceil(len(track) / 200))
+    pts = [[round(p.lon, 3), round(p.lat, 3), p.alt_ft] for p in track[::step]]
+    if track and (not pts or pts[-1][:2] != [round(track[-1].lon, 3), round(track[-1].lat, 3)]):
+        pts.append([round(track[-1].lon, 3), round(track[-1].lat, 3), track[-1].alt_ft])
+    return {
+        "hex": ac.hex, "label": ac.label, "desc": nice_desc(ac.description or ac.type_code or ac.hex),
+        "category": alert.top.category, "squawk": ac.squawk, "lat": ac.lat, "lon": ac.lon, "heading": ac.heading,
+        "track": pts, "last_seen": ac.seen_ts,
+    }
 
-    pts = [(a.aircraft.lon, a.aircraft.lat) for a in alerts if a.aircraft.lat is not None]
+
+def render_overview(alerts: list[Alert], path, title: str = "PLANE ALERT", brand: str = "plane watch",
+                    when_ts: float | None = None, sample: bool = False, earlier: list[dict] | None = None,
+                    keep_hours: float | None = None):
+    """The emergency map: aircraft in an emergency now (bright, glowing) and, dimmed, the ones
+    that were in an emergency earlier (`earlier`, map_item dicts) with the time they cleared."""
+    from .classify import is_emergency
+
+    active = [map_item(a) for a in alerts if is_emergency(a) and a.aircraft.lat is not None]
+    active_hex = {i["hex"] for i in active}
+    past = sorted((i for i in (earlier or []) if i["hex"] not in active_hex and i.get("lat") is not None),
+                  key=lambda i: -(i.get("last_seen") or 0))
+    card = Card(title, brand)
+    worst = max(active, key=lambda i: CATEGORIES[i["category"]]["severity"]) if active else None
+    accent = CATEGORIES[worst["category"]]["color"] if worst else "#5ac8a8"
+    when_ts = when_ts or max((i.get("last_seen") or 0 for i in active), default=0) or datetime.now(timezone.utc).timestamp()
+    when = datetime.fromtimestamp(when_ts, timezone.utc).strftime("%d %b %Y · %H:%M UTC")
+    keep = f" (last {keep_hours:g} h)" if keep_hours else ""
+    card.chrome(accent, f"{len(active)} emergenc{'y' if len(active) == 1 else 'ies'} now · {len(past)} earlier{keep} · "
+                        f"position: ADS-B community feeds · map: Natural Earth · {brand}", when, sample)
+
+    # ---- list
+    if active:
+        card.pill(15, 54, f"{len(active)} EMERGENC{'Y' if len(active) == 1 else 'IES'} NOW", 6.3, "#0b0d10", accent)
+    else:
+        card.pill(15, 54, "NO ACTIVE EMERGENCIES", 6.3, C["text"], "#ffffff", bg_alpha=0.08)
+    y, rows = 82, 0
+    for i in sorted(active, key=lambda i: -CATEGORIES[i["category"]]["severity"]):
+        if rows >= 15:
+            break
+        _list_row(card, y, i, live=True)
+        y, rows = y + 21, rows + 1
+    if past and rows < 15:
+        y += 4
+        card.text(15, y, f"EARLIER{keep.upper()}", px=5.4, color=C["faint"], weight="bold")
+        y += 15
+        for i in past:
+            if rows >= 15:
+                break
+            _list_row(card, y, i, live=False)
+            y, rows = y + 21, rows + 1
+    hidden = len(active) + len(past) - rows
+    if hidden > 0:
+        card.text(25, y, f"+ {hidden} more", px=6, color=C["muted"])
+
+    # ---- map
+    pts = [(i["lon"], i["lat"]) for i in active + past]
+    for i in active + past:
+        pts += [(p[0], p[1]) for p in i.get("track", [])[::10]]
     m = MapFrame(card, pts or [(-150, -50), (170, 70)], min_span_deg=60 if pts else 320, clamp_lat=(-70, 80))
     m.land()
-    for a in alerts:
-        if a.aircraft.lat is None:
-            continue
-        cat = CATEGORIES[a.top.category]
-        x, y_ = m.P(a.aircraft.lon, a.aircraft.lat)
-        m.glow_dot(a.aircraft.lon, a.aircraft.lat, cat["color"], 16, z=5)
-        m.ax.plot([x], [y_], marker=plane_marker(a.aircraft.heading), ms=11 * PT, color=cat["color"], mec="#ffffff", mew=0.3, zorder=6)
-        m.ax.annotate(a.aircraft.label, (x, y_), xytext=(9 * PT, 5 * PT), textcoords="offset points", fontsize=fs(6.4), color=C["text"],
-                      fontweight="bold", zorder=7, bbox=dict(boxstyle="round,pad=0.4,rounding_size=0.6", fc=C["glass"], ec="none", alpha=0.78))
+    for i in past:  # dimmed first, so the live ones sit on top
+        _map_item(m, i, live=False)
+    for i in active:
+        _map_item(m, i, live=True)
     card.save(path)
     return path
+
+
+def _list_row(card: Card, y, item: dict, live: bool):
+    cat = CATEGORIES[item["category"]]
+    a = 1.0 if live else 0.45
+    card.ov.plot([16], [y - 3], "o", ms=4 * PT, color=cat["color"], alpha=a, mew=0, zorder=6)
+    if live:
+        card.ov.plot([16], [y - 3], "o", ms=9 * PT, color=cat["color"], alpha=0.18, mew=0, zorder=6)
+    card.text(25, y, item["label"], px=7.6, weight="bold", color=C["text"] if live else C["muted"])
+    right = textwrap.shorten(cat["label"], 22, placeholder="…") if live else f"cleared {_hhmm(item.get('last_seen'))}"
+    card.text(PANEL_W - 12, y, right, px=5.5, color=cat["color"] if live else C["faint"], ha="right", weight="bold")
+    card.text(25, y + 9, textwrap.shorten(item.get("desc") or "", 36, placeholder="…"), px=5.6, color=C["muted"] if live else C["faint"])
+
+
+def _map_item(m: MapFrame, item: dict, live: bool):
+    cat = CATEGORIES[item["category"]]
+    track = item.get("track") or []
+    if len(track) >= 2:
+        lons = _unwrap([p[0] for p in track])
+        xy = [m.P(lo, p[1]) for lo, p in zip(lons, track)]
+        segs = [[xy[k], xy[k + 1]] for k in range(len(xy) - 1)]
+        n = len(segs)
+        cols = []
+        for k in range(n):
+            c = ALT_CMAP(alt_frac(track[k + 1][2]))
+            f = (0.15 + 0.7 * (k / max(1, n - 1))) if live else 0.22
+            cols.append((c[0], c[1], c[2], f))
+        if live:
+            m.ax.add_collection(LineCollection(segs, colors=[(c[0], c[1], c[2], c[3] * 0.25) for c in cols], linewidths=4 * PT, capstyle="butt", zorder=3))
+        m.ax.add_collection(LineCollection(segs, colors=cols, linewidths=(1.3 if live else 0.9) * PT, capstyle="butt", zorder=3.2))
+    x, y = m.P(item["lon"], item["lat"])
+    if live:
+        m.glow_dot(item["lon"], item["lat"], cat["color"], 16, z=5)
+        m.ax.plot([x], [y], marker=plane_marker(item.get("heading")), ms=11 * PT, color=cat["color"], mec="#ffffff", mew=0.3, zorder=6)
+        m.ax.annotate(item["label"], (x, y), xytext=(9 * PT, 5 * PT), textcoords="offset points", fontsize=fs(6.4), color=C["text"],
+                      fontweight="bold", zorder=7, bbox=dict(boxstyle="round,pad=0.4,rounding_size=0.6", fc=C["glass"], ec="none", alpha=0.78))
+    else:
+        m.ax.plot([x], [y], marker=plane_marker(item.get("heading")), ms=8 * PT, color=cat["color"], alpha=0.4, mew=0, zorder=4)
+        m.ax.annotate(f"{item['label']} · cleared {_hhmm(item.get('last_seen'))[:5]}", (x, y), xytext=(7 * PT, 4 * PT),
+                      textcoords="offset points", fontsize=fs(5.6), color=C["muted"], zorder=4.5,
+                      bbox=dict(boxstyle="round,pad=0.35,rounding_size=0.6", fc=C["glass"], ec="none", alpha=0.55))
