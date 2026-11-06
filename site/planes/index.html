@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Plane Alerts</title>
+  <meta name="description" content="Aircraft squawking 7500/7600/7700 or flagged in ACARS messages (bomb threats, diversions, medical, security).">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 16 16%22%3E%3Ccircle cx=%228%22 cy=%228%22 r=%227%22 fill=%22%23ff3b30%22/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="../style.css">
+  <style>
+    .chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 12px 0; }
+    .chip { border: 1px solid var(--line); background: var(--card); color: var(--text); border-radius: 999px;
+            padding: 4px 10px; font: inherit; font-size: 13px; cursor: pointer; }
+    .chip[aria-pressed="true"] { border-color: var(--text); font-weight: 600; }
+    .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 6px; vertical-align: 0; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 440px), 1fr)); gap: 14px; margin: 12px 0 28px; }
+    .alert { background: var(--card); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+    .alert img { display: block; width: 100%; height: auto; aspect-ratio: 16 / 9; background: #12161b; }
+    .alert .body { padding: 10px 12px 12px; font-size: 14px; }
+    .alert .head { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+    .alert .cat { font-size: 12px; font-weight: 700; letter-spacing: .02em; }
+    .alert ul { margin: 6px 0 0; padding-left: 18px; color: var(--muted); font-size: 13px; }
+    .alert code { font-size: 12px; white-space: pre-wrap; word-break: break-word; }
+    .overview img { width: 100%; height: auto; border-radius: 10px; border: 1px solid var(--line); }
+    .errors { color: var(--warn); font-size: 13px; }
+    .downloads a { margin-right: 12px; }
+  </style>
+</head>
+<body>
+  <header class="top">
+    <div class="wrap top-row">
+      <div>
+        <h1>Plane Alerts</h1>
+        <p class="sub">Emergency squawks (7500 / 7600 / 7700) and ACARS threats: bombs, diversions, medical, security</p>
+      </div>
+      <label class="picker">
+        <span>Run</span>
+        <select id="run-select" aria-label="Choose a run"></select>
+      </label>
+    </div>
+  </header>
+
+  <main class="wrap" id="app"><p class="muted">Loading…</p></main>
+
+  <footer class="wrap foot">
+    Positions: adsb.lol / airplanes.live / adsb.fi community ADS-B feeds. ACARS: your own decoder or airframes.io.
+    Photos: planespotters.net. Map: Natural Earth. A squawk can be a mistaken code and an ACARS keyword can be a false
+    match, so check the evidence before treating anything here as confirmed. <a href="../">Social topics</a>
+  </footer>
+
+  <script>
+    const COLORS = {hijack:"#ff2d55", bomb:"#ff2d55", downed:"#ff2d55", security:"#ff6b2d", emergency:"#ff3b30", fire:"#ff6b2d",
+      technical:"#ff9f0a", medical:"#ff9f0a", fuel:"#ff9f0a", diversion:"#e0b800", radio:"#e0b800", lost_link:"#3aa7d6",
+      intercept:"#3aa7d6", watch:"#3fae8f"};
+    const app = document.getElementById("app"), sel = document.getElementById("run-select");
+    const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+    let filter = null, report = null;
+
+    async function getJSON(url) { const r = await fetch(url, {cache: "no-cache"}); if (!r.ok) throw new Error(url + ": " + r.status); return r.json(); }
+
+    async function init() {
+      let index;
+      try { index = await getJSON("data/index.json"); } catch { index = {runs: []}; }
+      if (!index.runs.length) { app.innerHTML = '<p class="muted">No runs yet. Start one from Actions → Plane watch → Run workflow.</p>'; return; }
+      sel.innerHTML = index.runs.map(r => `<option value="${esc(r.id)}">${esc(r.generated_at.replace("T", " ").slice(0, 16))} UTC · ${r.alerts} alert${r.alerts === 1 ? "" : "s"}</option>`).join("");
+      const want = new URLSearchParams(location.hash.slice(1)).get("run");
+      if (want && index.runs.some(r => r.id === want)) sel.value = want;
+      sel.onchange = () => { location.hash = "run=" + sel.value; load(sel.value); };
+      load(sel.value);
+    }
+
+    async function load(id) {
+      app.innerHTML = '<p class="muted">Loading…</p>';
+      try { report = await getJSON(`data/runs/${encodeURIComponent(id)}.json`); } catch (e) { app.innerHTML = `<p class="errors">${esc(e.message)}</p>`; return; }
+      filter = null; render();
+    }
+
+    function render() {
+      const alerts = report.alerts || [];
+      const cats = {};
+      alerts.forEach(a => { cats[a.category] = (cats[a.category] || 0) + 1; });
+      const shown = filter ? alerts.filter(a => a.category === filter) : alerts;
+      app.innerHTML = `
+        <p class="meta"><strong>${alerts.length}</strong> flagged aircraft · squawks ${esc((report.squawks || []).join(", ") || "—")}
+          · ACARS ${report.acars_messages ?? 0} messages, ${report.acars_flagged ?? 0} flagged ${report.sample ? "· <strong>sample data</strong>" : ""}</p>
+        ${(report.errors || []).length ? `<details class="errors"><summary>${report.errors.length} source warning(s)</summary><ul>${report.errors.map(e => `<li>${esc(e)}</li>`).join("")}</ul></details>` : ""}
+        <p class="downloads"><a href="data/runs/${esc(report.id)}.json">Run JSON</a><a href="data/alerts.csv">All alerts (CSV)</a><a href="data/acars_flagged.jsonl">Flagged ACARS (JSONL)</a></p>
+        ${report.overview ? `<div class="overview"><img src="${esc(report.overview)}" alt="Map of all flagged aircraft in this run" loading="lazy"></div>` : ""}
+        <div class="chips">
+          <button class="chip" aria-pressed="${!filter}" data-cat="">All (${alerts.length})</button>
+          ${Object.entries(cats).map(([c, n]) => `<button class="chip" aria-pressed="${filter === c}" data-cat="${esc(c)}"><span class="dot" style="background:${COLORS[c] || "#888"}"></span>${esc(c)} (${n})</button>`).join("")}
+        </div>
+        <div class="grid">${shown.map(card).join("") || '<p class="muted">Nothing flagged in this run.</p>'}</div>`;
+      app.querySelectorAll(".chip").forEach(b => b.onclick = () => { filter = b.dataset.cat || null; render(); });
+    }
+
+    function card(a) {
+      const ac = a.aircraft, color = COLORS[a.category] || "#888";
+      const acars = (a.acars || [])[0];
+      return `<article class="alert">
+        ${a.card ? `<a href="${esc(a.card)}"><img src="${esc(a.card)}" alt="Card for ${esc(ac.callsign || ac.hex)}" loading="lazy"></a>` : ""}
+        <div class="body">
+          <div class="head"><strong>${esc(ac.callsign || ac.registration || ac.hex)}</strong>
+            <span class="cat" style="color:${color}">${esc(a.category_label)}</span></div>
+          <div class="muted">${esc([ac.description || ac.type_code, ac.registration, ac.hex, ac.squawk && "squawk " + ac.squawk].filter(Boolean).join(" · "))}</div>
+          <ul>${a.flags.map(f => f.origin === "acars"
+              ? `<li>ACARS: ${esc(f.category)} (“${esc(f.matched)}”)${f.divert_to ? " → " + esc(f.divert_to) : ""}</li>`
+              : `<li>${esc(f.evidence)}</li>`).join("")}</ul>
+          ${acars ? `<p><code>${esc(acars.text)}</code></p>` : ""}
+        </div></article>`;
+    }
+    init();
+  </script>
+</body>
+</html>

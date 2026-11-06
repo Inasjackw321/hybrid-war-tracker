@@ -1,0 +1,96 @@
+name: Plane watch
+
+on:
+  workflow_dispatch:
+    inputs:
+      squawks:
+        description: "Squawk codes to look for, comma-separated (7400 UAV lost link and 7777 US intercept also work)"
+        required: false
+        default: "7500,7600,7700"
+      watch_minutes:
+        description: "Keep polling this many minutes to build live tracks (0 = one snapshot)"
+        required: false
+        default: "5"
+      hex:
+        description: "Optional: also render these aircraft (ICAO hex, comma-separated) even if nothing is wrong"
+        required: false
+        default: ""
+  # Uncomment to check automatically every 30 minutes:
+  # schedule:
+  #   - cron: "11,41 * * * *"
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages-site  # shared with scan.yml so the two never deploy over each other
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install
+        run: pip install -r requirements.txt
+
+      - name: Run tests
+        run: python -m unittest -q tests.test_plane_watch
+
+      - name: Cache map data
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/plane_watch
+          key: plane-watch-naturalearth-v1
+
+      - name: Scan
+        env:
+          SQUAWKS: ${{ inputs.squawks || '7500,7600,7700' }}
+          WATCH: ${{ inputs.watch_minutes || '0' }}
+          # Optional: ACARS from airframes.io
+          AIRFRAMES_API_KEY: ${{ secrets.AIRFRAMES_API_KEY }}
+        run: |
+          python -m plane_watch scan --squawks "$SQUAWKS" --watch-minutes "$WATCH" \
+            --military-emergencies --run-id "run-${{ github.run_id }}"
+
+      - name: Render requested aircraft
+        if: inputs.hex != ''
+        env:
+          HEXES: ${{ inputs.hex }}
+        run: python -m plane_watch render --hex "$HEXES" || echo "::warning::some requested aircraft were not found"
+
+      - name: Save results to the repo
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A site/planes
+          git commit -m "Plane watch results (run ${{ github.run_id }})" || exit 0
+          for i in 1 2 3; do
+            git pull --rebase origin "$GITHUB_REF_NAME" && git push origin "HEAD:$GITHUB_REF_NAME" && break
+            sleep 5
+          done
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: site
+
+  deploy:
+    needs: watch
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
