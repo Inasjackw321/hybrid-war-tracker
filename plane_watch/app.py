@@ -120,6 +120,19 @@ class LiveApp:
         self.logged_msgs = set(self.history.get("_acars_logged", []))
         self.history.pop("_acars_logged", None)
         self.locate_cache: dict[str, object] = {}
+        self.client.on_progress = self.progress
+        self._last_progress = 0.0
+
+    def progress(self, message: str, checking: bool = True):
+        """Tell the dashboard what's happening right now (throttled)."""
+        now = time.time()
+        if checking and now - self._last_progress < 0.7:
+            return
+        self._last_progress = now
+        try:
+            self._write("progress.json", {"message": message, "ts": now, "checking": checking})
+        except OSError:
+            pass
 
     def _load(self, name, default):
         try:
@@ -129,7 +142,7 @@ class LiveApp:
 
     def _write(self, name, obj):
         tmp = self.out / "data" / (name + ".tmp")
-        tmp.write_text(json.dumps(obj, indent=1))
+        tmp.write_text(json.dumps(obj, indent=1), encoding="utf-8")
         tmp.replace(self.out / "data" / name)
 
     # ------------------------------------------------------------ gather
@@ -151,7 +164,9 @@ class LiveApp:
 
     def cycle(self) -> dict:
         self.client.errors = []
+        self.client.ok_requests = 0
         started = time.time()
+        self.progress("Reading ACARS…")
         msgs = self.acars()
         flagged = pipeline.flagged_messages(msgs)
         aircraft = {ac.hex: ac for ac in self.client.squawks(ALL_SQUAWKS)}
@@ -169,6 +184,7 @@ class LiveApp:
             if entry:
                 self._carry_over(entry["alert"], alert)
             else:
+                self.progress(f"Getting track, route and photo for {alert.aircraft.label}")
                 pipeline.enrich(alert, self.client, fetch_photos=not self.args.no_photos, trace_hours=8)
                 entry = {"first_seen": now, "photo_bytes": self._photo(alert), "rendered_ts": None, "sig": None}
             entry.update(alert=alert, last_seen=now)
@@ -178,6 +194,7 @@ class LiveApp:
                    (alert.divert_airport or {}).get("icao"))
             if alert.aircraft.lat is not None and entry["sig"] != sig:
                 name = f"cards/{alert.aircraft.hex}.png"
+                self.progress(f"Drawing the card for {alert.aircraft.label}")
                 try:
                     render.render_card(alert, self.out / name, entry["photo_bytes"], title=self.args.title, brand=self.args.brand)
                     alert.card = name
@@ -193,9 +210,15 @@ class LiveApp:
         for h in [h for h, e in self.known.items() if h not in live_hex and now - e["last_seen"] > FORGET_AFTER_S]:
             del self.known[h]
 
+        self.progress("Drawing the overview map")
         render.render_overview(alerts, self.out / "cards" / "overview.png", title=self.args.title, brand=self.args.brand)
         self._record(alerts, flagged, now)
+        feeds_ok = self.client.ok_requests > 0
         status = {
+            "phase": "ok" if feeds_ok else "offline",
+            "message": "" if feeds_ok else (
+                "None of the flight-tracking feeds answered (" + ", ".join(self.client.sources) + "). Check your internet "
+                "connection; a firewall, VPN, school/work network or antivirus may be blocking them. It keeps trying."),
             "updated_at": _iso(now),
             "updated_ts": now,
             "next_update_ts": started + self.args.interval,
@@ -209,12 +232,24 @@ class LiveApp:
                 "airframes": bool(os.environ.get("AIRFRAMES_API_KEY")),
                 "files": self.args.acars_file or [],
             },
-            "errors": self.client.errors + ([self.listener.error] if self.listener and self.listener.error else []),
+            "errors": _tidy(self.client.errors) + ([self.listener.error] if self.listener and self.listener.error else []),
             "alerts": [self._summary(e, live=True) for e in sorted(current, key=lambda e: -classify.severity(e["alert"].top.category))],
             "cleared": [self._summary(e, live=False) for e in sorted(cleared, key=lambda e: -e["last_seen"])],
         }
         self._write("live.json", status)
+        self.progress("", checking=False)
         return status
+
+    def _stub(self, phase: str, message: str) -> dict:
+        """A live.json for before the first check finishes (or when a check crashed)."""
+        now = time.time()
+        return {
+            "phase": phase, "message": message, "updated_at": _iso(now), "updated_ts": now, "next_update_ts": now,
+            "interval_s": self.args.interval, "squawks": list(ALL_SQUAWKS), "sources": self.client.sources,
+            "acars": {"messages": 0, "flagged": 0, "udp_port": self.args.udp_port if self.listener and not self.listener.error else None,
+                      "udp_received": 0, "airframes": bool(os.environ.get("AIRFRAMES_API_KEY")), "files": self.args.acars_file or []},
+            "errors": list(self.client.errors), "alerts": [], "cleared": [],
+        }
 
     def _carry_over(self, old: Alert, new: Alert):
         """Reuse what we already fetched for this aircraft; extend its track."""
@@ -275,7 +310,7 @@ class LiveApp:
                 del self.history[k]
         if new_ids:
             pipeline._append_csv(self.out / "data" / "alerts.csv", new_ids, "live", _iso(now))
-        with (self.out / "data" / "acars_flagged.jsonl").open("a") as fh:
+        with (self.out / "data" / "acars_flagged.jsonl").open("a", encoding="utf-8") as fh:
             for m, flags in flagged:
                 key = f"{m.ts}|{m.registration}|{m.flight}|{hashlib.sha1(m.text.encode()).hexdigest()[:12]}"
                 if key in self.logged_msgs:
@@ -295,11 +330,14 @@ class LiveApp:
         url = f"http://localhost:{port}/"
         if self.listener:
             self.listener.start()
+        self._write("live.json", self._stub("starting", "Checking the feeds for the first time…"))
+        self.progress("Starting…")
         print(f"\n  PLANE WATCH  ·  dashboard: {url}")
         print(f"  watching squawks {', '.join(ALL_SQUAWKS)} + military emergencies + ACARS threats")
         if self.listener and not self.listener.error:
             print(f"  ACARS: listening for decoder JSON on UDP port {self.args.udp_port}")
-        print(f"  saving to {self.out}   (Ctrl+C to stop)\n")
+        print(f"  saving to {self.out}   (Ctrl+C to stop)")
+        print("  first check: about 20-60 seconds…\n", flush=True)
         if self.args.once:
             self._report(self.cycle())
             return 0
@@ -310,13 +348,25 @@ class LiveApp:
             try:
                 self._report(self.cycle())
             except Exception as e:  # noqa: BLE001 - keep the app alive through network hiccups
-                print(f"  ! cycle failed: {e}", file=sys.stderr)
+                import traceback
+
+                traceback.print_exc()
+                print(f"  ! check failed: {e}  (trying again in {self.args.interval:.0f}s)", file=sys.stderr)
+                stub = self._stub("error", f"The last check failed: {type(e).__name__}: {e}")
+                stub["next_update_ts"] = time.time() + self.args.interval
+                self._write("live.json", stub)
+                self.progress("", checking=False)
             time.sleep(max(5, self.args.interval - (time.time() - t0)))
 
     @staticmethod
     def _report(status: dict):
         stamp = datetime.now().strftime("%H:%M:%S")
         alerts = status["alerts"]
+        if status.get("phase") == "offline":
+            print(f"  {stamp}  ! couldn't reach any flight-tracking feed. Problems:")
+            for e in status["errors"][:6]:
+                print(f"           - {e}")
+            return
         if not alerts:
             print(f"  {stamp}  all quiet: nothing squawking 7x00 or flagged in ACARS")
         else:
@@ -327,6 +377,16 @@ class LiveApp:
         failed = len(status["errors"])
         if failed:
             print(f"           ({failed} source warning{'s' if failed > 1 else ''}; see the dashboard)")
+
+
+def _tidy(errors: list[str]) -> list[str]:
+    """Drop the follow-up "skipped" notes and exact repeats; keep the first real error per problem."""
+    out = []
+    for e in errors:
+        if "skipped: it didn't respond" in e or e in out:
+            continue
+        out.append(e)
+    return out
 
 
 class _CachedLocator:

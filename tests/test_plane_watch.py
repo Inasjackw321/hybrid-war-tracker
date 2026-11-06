@@ -376,3 +376,34 @@ class BuildAppTests(unittest.TestCase):
                                env={**os.environ, "PLANE_WATCH_OFFLINE": "1"}, timeout=240)
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertEqual(len(list((Path(d) / "out" / "cards").glob("*.png"))), 4)
+
+
+class NetworkFailureTests(unittest.TestCase):
+    def test_unreachable_host_is_skipped_quickly(self):
+        import urllib.error
+
+        from plane_watch import http
+
+        http._dead_hosts.clear()
+        env = {k: v for k, v in os.environ.items() if k != "PLANE_WATCH_OFFLINE"}
+        with mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch("urllib.request.urlopen", side_effect=urllib.error.URLError("timed out")) as urlopen:
+            with self.assertRaises(http.FetchError) as first:
+                http.get_json("https://feed.example/a")
+            with self.assertRaises(http.FetchError):
+                http.get_json("https://feed.example/b")
+        self.assertTrue(first.exception.network)
+        self.assertEqual(urlopen.call_count, 1)  # second request never left the machine
+        self.assertIn("feed.example", http.dead_hosts())
+        http._dead_hosts.clear()
+
+    def test_app_says_offline_instead_of_all_quiet(self):
+        from plane_watch.app import LiveApp, parser
+
+        with tempfile.TemporaryDirectory() as d, \
+                mock.patch.object(adsb.http, "get_json", side_effect=adsb.http.FetchError("x unreachable", network=True)), \
+                mock.patch.object(adsb.time, "sleep"):
+            app = LiveApp(parser().parse_args(["--out", d, "--udp-port", "0", "--no-browser"]))
+            status = app.cycle()
+        self.assertEqual(status["phase"], "offline")
+        self.assertIn("feeds", status["message"])

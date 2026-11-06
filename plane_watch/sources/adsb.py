@@ -88,14 +88,23 @@ class AdsbClient:
         self.gap_s = gap_s
         self.errors: list[str] = []
         self._last = 0.0
+        self.on_progress = None  # optional callback(str) for status messages
+        self.ok_requests = 0  # successful API answers since the last reset
 
     def _get(self, source: str, kind: str, arg: str = "") -> list[Aircraft]:
         conf = SOURCES[source]
+        if self.on_progress:
+            self.on_progress(f"Asking {source} for {'squawk ' + arg if kind == 'sqk' else kind + ' ' + arg}".strip())
+        host = conf["api"].split("/")[2]
+        if host in http.dead_hosts():  # don't even wait for the rate-limit gap
+            raise http.FetchError(f"{host} skipped: it didn't respond a moment ago", network=True)
         wait = self.gap_s - (time.time() - self._last)
         if wait > 0:
             time.sleep(wait)
         self._last = time.time()
-        return parse_response(http.get_json(conf["api"] + conf["paths"][kind].format(arg)), source)
+        found = parse_response(http.get_json(conf["api"] + conf["paths"][kind].format(arg)), source)
+        self.ok_requests += 1
+        return found
 
     def query(self, kind: str, arg: str = "") -> list[Aircraft]:
         """Ask each source in turn; merge results by hex (first source wins, later ones fill gaps)."""

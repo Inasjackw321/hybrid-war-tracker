@@ -113,7 +113,7 @@
   <div class="pills" id="pills"></div>
   <div id="current"></div>
   <h2>Overview</h2>
-  <div class="overview"><img id="overview" alt="Map of every flagged aircraft" src="cards/overview.png"></div>
+  <div class="overview"><img id="overview" alt="Map of every flagged aircraft" style="display:none" onload="this.style.display='block'" onerror="this.style.display='none'"></div>
   <div id="cleared"></div>
   <h2>Sources</h2>
   <div class="row" id="sources"></div>
@@ -135,17 +135,24 @@ const COLORS = {hijack:"#ff2d55", bomb:"#ff2d55", downed:"#ff2d55", security:"#f
   intercept:"#64d2ff", watch:"#5ac8a8"};
 const $ = id => document.getElementById(id);
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
-let live = null, lastTs = 0, filter = null, history = {};
+let live = null, lastTs = 0, filter = null, history = {}, prog = {};
 
 function ago(ts) { const s = Math.round(Date.now() / 1000 - ts); return s < 60 ? `${s}s ago` : `${Math.round(s / 60)} min ago`; }
 
 function tick() {
   if (!live) return;
-  const age = Date.now() / 1000 - live.updated_ts, next = Math.max(0, Math.round(live.next_update_ts - Date.now() / 1000));
-  const stale = age > live.interval_s * 3;
-  $("dot").className = "dot " + (stale ? "stale" : live.errors.length ? "warn" : "ok");
-  $("status-text").textContent = stale ? `No update for ${ago(live.updated_ts).replace(" ago", "")}. Is the app still running?`
-    : `Updated ${ago(live.updated_ts)} · ${next > 0 ? "next check in " + next + "s" : "checking now…"}`;
+  const now = Date.now() / 1000, next = Math.max(0, Math.round(live.next_update_ts - now));
+  const checking = prog.checking && now - prog.ts < 120;
+  const heartbeat = Math.max(live.updated_ts, prog.ts || 0);
+  const stale = now - heartbeat > Math.max(180, live.interval_s * 3);
+  const p = checking && prog.message ? prog.message : "";
+  let text;
+  if (stale) text = `No update for ${ago(heartbeat).replace(" ago", "")}. Is the app still running?`;
+  else if (live.phase === "starting") text = p || "Checking the feeds for the first time…";
+  else text = `Updated ${ago(live.updated_ts)} · ` + (checking ? (p || "checking now…") : next > 0 ? `next check in ${next}s` : "checking now…");
+  $("dot").className = "dot " + (stale || live.phase === "error" || live.phase === "offline" ? "stale" : live.errors.length ? "warn" : "ok");
+  $("status-text").textContent = text;
+  const pl = $("progress-line"); if (pl) pl.textContent = p;
 }
 
 function highlight(text, flags) {
@@ -180,17 +187,23 @@ function render() {
     Object.entries(counts).map(([c, n]) => `<button class="pill" style="--c:${COLORS[c]}" aria-pressed="${filter === c}" data-c="${c}">${esc(c)} ${n}</button>`).join("") : "";
   document.querySelectorAll(".pill").forEach(b => b.onclick = () => { filter = b.dataset.c || null; render(); });
   const shown = filter ? alerts.filter(a => a.category === filter) : alerts;
-  $("current").innerHTML = alerts.length ? `<h2>Flagged now</h2><div class="grid">${shown.map(card).join("")}</div>`
+  $("current").innerHTML = live.phase === "starting"
+      ? `<div class="quiet"><strong>Checking the feeds…</strong>The first check takes about 20–60 seconds. This page fills in by itself.<div class="meta" id="progress-line"></div></div>`
+    : live.phase === "offline"
+      ? `<div class="quiet"><strong>Can't reach the flight-tracking feeds</strong>${esc(live.message)}<div class="meta">Details are under Warnings below.</div></div>`
+    : live.phase === "error"
+      ? `<div class="quiet"><strong>The last check failed</strong>${esc(live.message)}<div class="meta">It tries again automatically. The terminal window has the details.</div></div>`
+    : alerts.length ? `<h2>Flagged now</h2><div class="grid">${shown.map(card).join("")}</div>`
     : `<div class="quiet"><strong>All quiet</strong>Nothing is squawking an emergency code or flagged in ACARS right now. The page updates by itself.</div>`;
   $("cleared").innerHTML = live.cleared.length ? `<h2>Recently cleared</h2><div class="grid">${live.cleared.map(card).join("")}</div>` : "";
-  $("overview").src = "cards/overview.png?v=" + Math.round(live.updated_ts);
+  if (live.phase === "ok") $("overview").src = "cards/overview.png?v=" + Math.round(live.updated_ts);
   const a = live.acars;
   $("sources").innerHTML = `
     <div class="panel"><div class="k">ADS-B</div>${esc(live.sources.join(", "))}<div class="meta">every ${Math.round(live.interval_s)}s · squawks ${esc(live.squawks.join(", "))}</div></div>
     <div class="panel"><div class="k">ACARS</div>${a.messages} messages, ${a.flagged} flagged
       <div class="meta">${a.udp_port ? `Listening on UDP <code>${a.udp_port}</code> (${a.udp_received} received). Point acarsdec, dumpvdl2 or dumphfdl JSON output here.` : "UDP listener off."}
       ${a.airframes ? " airframes.io on." : " Set AIRFRAMES_API_KEY to add airframes.io."}</div></div>
-    <div class="panel"><div class="k">Warnings</div>${live.errors.length ? `<details class="errors"><summary>${live.errors.length} source warning(s)</summary><ul>${live.errors.map(e => `<li>${esc(e)}</li>`).join("")}</ul></details>` : '<span class="meta">None</span>'}</div>`;
+    <div class="panel"><div class="k">Warnings</div>${live.errors.length ? `<details class="errors" ${live.alerts.length ? "" : "open"}><summary>${live.errors.length} source warning(s)</summary><ul>${live.errors.map(e => `<li>${esc(e)}</li>`).join("")}</ul></details>` : '<span class="meta">None</span>'}</div>`;
   bindImages();
 }
 
@@ -213,6 +226,7 @@ $("lightbox").onclick = () => $("lightbox").classList.remove("open");
 $("search").oninput = renderHistory;
 
 async function poll() {
+  try { const r = await fetch("data/progress.json", {cache: "no-store"}); if (r.ok) prog = await r.json(); } catch {}
   try {
     const r = await fetch("data/live.json", {cache: "no-store"});
     if (r.ok) {
@@ -225,7 +239,7 @@ async function poll() {
   } catch {}
   tick();
 }
-poll(); setInterval(poll, 8000); setInterval(tick, 1000);
+poll(); setInterval(poll, 3000); setInterval(tick, 1000);
 </script>
 </body>
 </html>

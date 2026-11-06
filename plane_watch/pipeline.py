@@ -133,7 +133,7 @@ def save_run(alerts: list[Alert], out: Path, run_id: str, meta: dict) -> dict:
         **meta,
         "alerts": [a.to_dict() for a in sorted(alerts, key=lambda a: -classify.severity(a.top.category))],
     }
-    (data_dir / "runs" / f"{run_id}.json").write_text(json.dumps(report, indent=1))
+    (data_dir / "runs" / f"{run_id}.json").write_text(json.dumps(report, indent=1), encoding="utf-8")
 
     index_path = data_dir / "index.json"
     index = json.loads(index_path.read_text()) if index_path.exists() else {"runs": []}
@@ -144,10 +144,10 @@ def save_run(alerts: list[Alert], out: Path, run_id: str, meta: dict) -> dict:
     index["runs"].insert(0, {"id": run_id, "generated_at": report["generated_at"], "alerts": len(alerts), "categories": counts,
                              "overview": meta.get("overview", "")})
     index["runs"] = index["runs"][:500]
-    index_path.write_text(json.dumps(index, indent=1))
+    index_path.write_text(json.dumps(index, indent=1), encoding="utf-8")
 
     _append_csv(data_dir / "alerts.csv", alerts, run_id, report["generated_at"])
-    with (data_dir / "acars_flagged.jsonl").open("a") as fh:
+    with (data_dir / "acars_flagged.jsonl").open("a", encoding="utf-8") as fh:
         for a in alerts:
             for m in a.messages:
                 row = {k: v for k, v in asdict(m).items() if k != "raw"}
@@ -164,7 +164,7 @@ CSV_FIELDS = ["run", "generated_at", "alert_id", "category", "severity", "all_ca
 
 def _append_csv(path: Path, alerts: list[Alert], run_id: str, generated_at: str):
     new = not path.exists()
-    with path.open("a", newline="") as fh:
+    with path.open("a", newline="", encoding="utf-8") as fh:
         w = csv.DictWriter(fh, fieldnames=CSV_FIELDS)
         if new:
             w.writeheader()
