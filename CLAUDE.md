@@ -28,7 +28,7 @@ The ADS-B feeds can't be reached from cloud sessions either, so use GitHub Actio
 2. Wait for the run with `actions_list`, checking about every 2 minutes. A run takes roughly `watch_minutes` + 3 minutes.
 3. Read `site/planes/data/runs/run-<run_id>.json` from `main`. Reply with each alert's callsign, type, category and evidence (squawk, ACARS excerpt, diversion airport), plus any `errors`, and link `https://inasjackw321.github.io/hybrid-war-tracker/planes/#run=run-<run_id>`. Say that a squawk or keyword match isn't confirmation.
 
-`python -m plane_watch demo` renders sample cards offline when you just need to check the drawing code.
+`python -m plane_watch demo` renders sample cards offline when you just need to check the drawing code. For the local app, users run `python planewatch.pyz` (built by `tools/build_app.py` and published by `release-app.yml`); `python -m plane_watch` with no command starts the same app (`plane_watch/app.py`).
 
 ## Development
 

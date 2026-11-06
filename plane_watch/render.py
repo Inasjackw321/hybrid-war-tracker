@@ -1,7 +1,9 @@
 """Draw alert cards: info panel on the left, map with the track on the right.
 
-Everything is laid out in "design pixels" on an 800x450 canvas and rendered
-at SCALE (2 -> 1600x900 PNG).
+Laid out in "design pixels" on an 800x450 canvas, rendered at SCALE (2 ->
+1600x900 PNG). The style avoids hard edges: the panel, header and footer fade
+into the map, the map has a vignette, the track and aircraft glow, and the
+boxes are borderless frosted glass.
 """
 
 from __future__ import annotations
@@ -14,10 +16,12 @@ from datetime import datetime, timezone
 import matplotlib
 
 matplotlib.use("Agg")
+import matplotlib.patheffects as pe  # noqa: E402
 import matplotlib.pyplot as plt  # noqa: E402
+import numpy as np  # noqa: E402
 from matplotlib.collections import LineCollection, PolyCollection  # noqa: E402
-from matplotlib.colors import LinearSegmentedColormap  # noqa: E402
-from matplotlib.patches import FancyBboxPatch, Rectangle  # noqa: E402
+from matplotlib.colors import LinearSegmentedColormap, to_rgb  # noqa: E402
+from matplotlib.patches import FancyBboxPatch  # noqa: E402
 from matplotlib.path import Path as MPath  # noqa: E402
 
 from . import basemap, geo  # noqa: E402
@@ -25,15 +29,17 @@ from .classify import CATEGORIES, SQUAWKS  # noqa: E402
 from .models import Alert, Flag  # noqa: E402
 
 W, H = 800, 450
-ROUTE_SHOW_KM = 1200  # show planned origin/destination on the map when this close
 SCALE = 2
+PT = SCALE * 0.72  # points per design pixel
 HEADER_H, FOOTER_H, PANEL_W = 36, 22, 203
-MAP_X0 = PANEL_W + 4
+MAP_L = PANEL_W - 60  # the map starts under the panel so the panel can fade into it
+VIS = (PANEL_W + 14, HEADER_H + 6, W, H - FOOTER_H - 4)  # the part of the map that's clearly visible
+ROUTE_SHOW_KM = 1200  # show planned origin/destination on the map when this close
 
 C = {
-    "bg": "#12161b", "header": "#1a1e24", "panel": "#171b21", "ocean": "#161b22", "land": "#272c34",
-    "coast": "#3b424c", "text": "#f2f4f7", "muted": "#9aa3ad", "faint": "#6b747e", "city": "#d5dbe1",
-    "footer": "#b3bf7a", "rule": "#2c323a",
+    "bg": "#0e1217", "panel": "#131820", "panel2": "#0f1319", "ocean": "#0f141b", "land": "#1f262f",
+    "coast": "#2c3540", "text": "#f2f4f7", "muted": "#8f99a5", "faint": "#5d6773", "city": "#c3cbd4",
+    "footer": "#a9b57c", "glass": "#0a0e13",
 }
 ALT_STOPS = [0, 4000, 8000, 20000, 40000]
 ALT_COLORS = ["#ff8c1a", "#ffd21a", "#35d63a", "#1fa8ff", "#ff2bf0"]
@@ -46,8 +52,8 @@ PLANE = _HALF + [(-x, y) for x, y in reversed(_HALF[1:-1])]
 
 
 def fs(px: float) -> float:
-    """Font size in points for a design-pixel height (100 dpi, SCALE)."""
-    return px * SCALE * 0.72
+    """Font size in points for a design-pixel height."""
+    return px * PT
 
 
 def alt_frac(alt) -> float:
@@ -88,6 +94,22 @@ def _badge_text(alert: Alert) -> str:
     return cat["label"]
 
 
+def _smooth(t):
+    t = np.clip(t, 0, 1)
+    return t * t * (3 - 2 * t)
+
+
+def _rgba(color, alpha):
+    """Image of `color` with the given alpha array."""
+    r, g, b = to_rgb(color)
+    img = np.empty(alpha.shape + (4,))
+    img[..., 0], img[..., 1], img[..., 2], img[..., 3] = r, g, b, alpha
+    return img
+
+
+HALO = [pe.withStroke(linewidth=2.6, foreground=C["ocean"], alpha=0.7)]
+
+
 # ------------------------------------------------------------------ map extent
 
 
@@ -117,57 +139,174 @@ def _extent(points: list[tuple[float, float]], aspect: float, min_span_deg: floa
     return cx - w / 2, cx + w / 2, cy - h / 2, cy + h / 2
 
 
-# ------------------------------------------------------------------ drawing
+# ------------------------------------------------------------------ canvas
 
 
 class Card:
     def __init__(self, title: str, brand: str):
         self.fig = plt.figure(figsize=(W * SCALE / 100, H * SCALE / 100), dpi=100, facecolor=C["bg"])
-        self.ui = self.fig.add_axes([0, 0, 1, 1], zorder=0)
-        self.ui.set_xlim(0, W)
-        self.ui.set_ylim(H, 0)
-        self.ui.axis("off")
         self.title, self.brand = title, brand
-        self._renderer = None
+        self.renderer = self.fig.canvas.get_renderer()
+        # overlay for the panel, header, footer and their fades (above the map)
+        self.ov = self.fig.add_axes([0, 0, 1, 1], zorder=3)
+        self.ov.set_xlim(0, W)
+        self.ov.set_ylim(H, 0)
+        self.ov.axis("off")
+        self.ov.patch.set_alpha(0)
 
-    @property
-    def renderer(self):
-        if self._renderer is None:
-            self.fig.canvas.draw()
-            self._renderer = self.fig.canvas.get_renderer()
-        return self._renderer
+    def text(self, x, y, s, px=8, color=None, weight="normal", ha="left", va="baseline", **kw):
+        return self.ov.text(x, y, s, fontsize=fs(px), color=color or C["text"], fontweight=weight, ha=ha, va=va, zorder=6, **kw)
 
-    def text(self, x, y, s, px=8, color=None, weight="normal", ha="left", va="baseline", ax=None, **kw):
-        ax = ax or self.ui
-        return ax.text(x, y, s, fontsize=fs(px), color=color or C["text"], fontweight=weight, ha=ha, va=va, **kw)
+    def measure(self, s, px, weight="normal", family=None) -> float:
+        kw = {"family": family} if family else {}
+        t = self.fig.text(0, 0, s, fontsize=fs(px), fontweight=weight, **kw)
+        w = t.get_window_extent(self.renderer).width / SCALE
+        t.remove()
+        return w
 
-    def rect(self, x, y, w, h, color, ax=None, **kw):
-        (ax or self.ui).add_patch(Rectangle((x, y), w, h, facecolor=color, edgecolor="none", **kw))
+    def image(self, img, x0, y0, x1, y1, z=2):
+        self.ov.imshow(img, extent=(x0, x1, y1, y0), origin="upper", aspect="auto", interpolation="bilinear", zorder=z)
+        self.ov.set_xlim(0, W)
+        self.ov.set_ylim(H, 0)
+
+    def pill(self, x, y, s, px, fg, bg, bg_alpha=1.0, weight="bold", ha="left"):
+        return self.text(x, y, s, px=px, color=fg, weight=weight, ha=ha, va="center",
+                         bbox=dict(boxstyle="round,pad=0.42,rounding_size=0.75", fc=bg, ec="none", alpha=bg_alpha))
 
     def chrome(self, accent: str, footer_left: str, footer_right: str, sample: bool = False):
-        self.rect(0, 0, W, HEADER_H, C["header"])
-        if sample:
-            self.text(W - 12, 22, "SAMPLE DATA — NOT A REAL EVENT", px=7.5, weight="bold", color="#ff453a", ha="right",
-                      bbox=dict(boxstyle="round,pad=0.35", fc="none", ec="#ff453a", lw=1.2))
-        self.rect(0, HEADER_H, PANEL_W, H - HEADER_H - FOOTER_H, C["panel"])
-        self.rect(PANEL_W + 1.5, HEADER_H, 2, H - HEADER_H - FOOTER_H, accent)
-        # logo: rounded tile with a tiny plane
-        self.ui.add_patch(FancyBboxPatch((8, 5), 26, 26, boxstyle="round,pad=0,rounding_size=4", fc="#26303c", ec="#3a4756", lw=1))
-        self.ui.plot([21], [18], marker=plane_marker(45), markersize=fs(13), color=accent, markeredgewidth=0)
+        ys = np.linspace(0, 1, 120)[:, None]
+        xs = np.linspace(0, 1, 160)[None, :]
+        # panel: solid, then a long soft fade into the map
+        fade_end = PANEL_W + 44
+        xpx = xs * fade_end
+        a = 1 - _smooth((xpx - (PANEL_W - 22)) / 66)
+        panel = _rgba(C["panel"], np.repeat(a, 120, axis=0))
+        shade = ys[..., None] * 0.6  # slight vertical shade
+        panel[..., :3] = panel[..., :3] * (1 - shade) + np.array(to_rgb(C["panel2"])) * shade
+        self.image(panel, 0, 0, fade_end, H, z=2)
+        # header and footer fade over the map
+        hy = np.linspace(0, 1, 60)[:, None] * np.ones((1, 4))
+        self.image(_rgba(C["bg"], 1 - _smooth((hy * 60 - 30) / 28)), 0, 0, W, 60, z=2.2)
+        fy = np.linspace(0, 1, 60)[:, None] * np.ones((1, 4))
+        self.image(_rgba(C["bg"], _smooth((fy * 46 - 6) / 32)), 0, H - 46, W, H, z=2.2)
+        # accent bloom behind the logo
+        bx, by = np.meshgrid(np.linspace(-1, 1, 80), np.linspace(-1, 1, 80))
+        self.image(_rgba(accent, np.exp(-(bx ** 2 + by ** 2) * 3) * 0.22), -30, -40, 90, 76, z=2.3)
+
+        self.ov.add_patch(FancyBboxPatch((9, 6), 24, 24, boxstyle="round,pad=0,rounding_size=7", fc="#ffffff", alpha=0.07, ec="none", zorder=5))
+        self.ov.plot([21], [18], marker=plane_marker(45), markersize=fs(12), color=accent, markeredgewidth=0, zorder=6)
         self.text(42, 22, self.brand, px=7.5, color=C["muted"])
-        brand_w = len(self.brand) * 4.1
-        self.text(42 + brand_w + 6, 24.5, self.title, px=13, weight="bold")
-        self.text(10, H - 7, footer_left, px=6.6, color=C["footer"])
-        self.text(W - 10, H - 7, footer_right, px=6.6, color=C["text"], ha="right")
+        self.text(42 + self.measure(self.brand, 7.5) + 7, 24.5, self.title, px=13, weight="bold")
+        if sample:
+            self.pill(W - 14, 18, "SAMPLE DATA — NOT A REAL EVENT", 7, "#ff6b61", "#ff453a", bg_alpha=0.16, ha="right")
+        self.text(12, H - 8, footer_left, px=6.4, color=C["footer"], alpha=0.9)
+        self.text(W - 12, H - 8, footer_right, px=6.4, color=C["text"], ha="right", alpha=0.9)
 
     def save(self, path):
         self.fig.savefig(path, dpi=100, facecolor=C["bg"])
         plt.close(self.fig)
 
 
-def _draw_photo(card: Card, alert: Alert, x, y, w, h, photo_bytes: bytes | None):
-    ax = card.fig.add_axes([x / W, 1 - (y + h) / H, w / W, h / H], zorder=2)
-    ax.set_axis_off()
+class MapFrame:
+    """A map axes that spans from MAP_L to the right edge and the full height.
+    Positions handed around are design px relative to the visible area VIS."""
+
+    def __init__(self, card: Card, points, min_span_deg=12.0, clamp_lat=None):
+        self.card = card
+        vx0, vy0, vx1, vy1 = VIS
+        self.vw, self.vh = vx1 - vx0, vy1 - vy0
+        x0, x1, y0, y1 = _extent(points, self.vw / self.vh, min_span_deg)
+        if clamp_lat:
+            y0, y1 = max(y0, geo.merc_y(clamp_lat[0])), min(y1, geo.merc_y(clamp_lat[1]))
+            # keep the aspect after clamping by widening x
+            need = (y1 - y0) * self.vw / self.vh
+            if need > x1 - x0:
+                cx = (x0 + x1) / 2
+                x0, x1 = cx - need / 2, cx + need / 2
+        self.ppx = self.vw / (x1 - x0)  # design px per projected unit
+        self.vx0, self.vy1_data = x0, y1  # projected coords of the visible top-left
+        self.ext = (x0, x1, y0, y1)
+        # whole axes extent (under the panel/header/footer too)
+        self.X0 = x0 - (vx0 - MAP_L) / self.ppx
+        self.X1 = x1
+        self.Y1 = y1 + vy0 / self.ppx
+        self.Y0 = y0 - (H - vy1) / self.ppx
+        self.AW, self.AH = W - MAP_L, H
+        ax = card.fig.add_axes([MAP_L / W, 0, self.AW / W, 1], zorder=1)
+        ax.set_facecolor(C["ocean"])
+        ax.set_xticks([])
+        ax.set_yticks([])
+        for s in ax.spines.values():
+            s.set_visible(False)
+        ax.set_xlim(self.X0, self.X1)
+        ax.set_ylim(self.Y0, self.Y1)
+        self.ax = ax
+        self.lon_lo, self.lon_hi = math.degrees(self.X0), math.degrees(self.X1)
+        self.lat_lo, self.lat_hi = geo.inv_merc_y(self.Y0), geo.inv_merc_y(self.Y1)
+
+    @staticmethod
+    def P(lon, lat):
+        return math.radians(lon), geo.merc_y(lat)
+
+    def to_px(self, lon, lat):
+        x, y = self.P(lon, lat)
+        return (x - self.vx0) * self.ppx, (self.vy1_data - y) * self.ppx
+
+    def axc(self, px, py):
+        """Visible-area px -> axes fraction."""
+        vx0, vy0, _, _ = VIS
+        return (vx0 - MAP_L + px) / self.AW, 1 - (vy0 + py) / self.AH
+
+    def land(self):
+        outers, holes, _ = basemap.land()
+
+        def polys(rings):
+            out = []
+            for ring in rings:
+                rl = [p[0] for p in ring]
+                rt = [p[1] for p in ring]
+                if max(rt) < self.lat_lo or min(rt) > self.lat_hi:
+                    continue
+                for shift in (-360, 0, 360):
+                    if max(rl) + shift < self.lon_lo or min(rl) + shift > self.lon_hi:
+                        continue
+                    out.append([self.P(lo + shift, max(-85, min(85, la))) for lo, la in ring])
+            return out
+
+        lw = 0.45 * PT
+        self.ax.add_collection(PolyCollection(polys(outers), facecolors=C["land"], edgecolors=C["coast"], linewidths=lw, zorder=1))
+        if holes:
+            self.ax.add_collection(PolyCollection(polys(holes), facecolors=C["ocean"], edgecolors=C["coast"], linewidths=lw, zorder=1))
+        # vignette: darken towards the edges, slightly lift the middle
+        xs, ys = np.meshgrid(np.linspace(-1, 1, 200), np.linspace(-1, 1, 120))
+        d = np.sqrt((xs * 0.9) ** 2 + (ys * 1.05) ** 2)
+        self.ax.imshow(_rgba("#000000", _smooth((d - 0.45) / 0.95) * 0.55), extent=(0, 1, 0, 1), transform=self.ax.transAxes,
+                       aspect="auto", interpolation="bilinear", zorder=1.5)
+        self.ax.set_xlim(self.X0, self.X1)
+        self.ax.set_ylim(self.Y0, self.Y1)
+
+    def glass(self, x, y, w, h, alpha=0.8, z=12):
+        """Borderless frosted box (visible-area px), with a soft shadow."""
+        bx, by = self.axc(x, y + h)
+        p = FancyBboxPatch((bx, by), w / self.AW, h / self.AH, transform=self.ax.transAxes,
+                           boxstyle=f"round,pad=0,rounding_size={6 / self.AW}", fc=C["glass"], ec="none", alpha=alpha, zorder=z,
+                           mutation_aspect=self.AW / self.AH)
+        p.set_path_effects([pe.SimplePatchShadow(offset=(0, -3), shadow_rgbFace="#000000", alpha=0.35), pe.Normal()])
+        self.ax.add_patch(p)
+
+    def glow_dot(self, lon, lat, color, size_px=16, z=9):
+        x, y = self.P(lon, lat)
+        for k, a in ((1.0, 0.05), (0.75, 0.07), (0.5, 0.1), (0.3, 0.14)):
+            self.ax.plot([x], [y], "o", ms=size_px * k * PT * 2, color=color, alpha=a, mew=0, zorder=z)
+
+    def text(self, px, py, s, size, color, z=12, **kw):
+        return self.ax.text(*self.axc(px, py), s, transform=self.ax.transAxes, fontsize=fs(size), color=color, zorder=z, **kw)
+
+
+# ------------------------------------------------------------------ panel
+
+
+def _draw_photo(card: Card, alert: Alert, x, y, w, h, photo_bytes: bytes | None, accent: str):
     img = None
     if photo_bytes:
         try:
@@ -176,7 +315,12 @@ def _draw_photo(card: Card, alert: Alert, x, y, w, h, photo_bytes: bytes | None)
             img = mpimg.imread(io.BytesIO(photo_bytes), format="jpg")
         except Exception:  # noqa: BLE001 - any decode error -> placeholder
             img = None
+    ys, xs = np.meshgrid(np.linspace(0, 1, 240), np.linspace(0, 1, 400), indexing="ij")
+    # feathered mask: soft on every side, softest at the bottom where it melts into the panel
+    mask = _smooth(xs / 0.07) * _smooth((1 - xs) / 0.07) * _smooth(ys / 0.08) * _smooth((1 - ys) / 0.3)
     if img is not None:
+        if img.dtype != np.float32 and img.dtype != np.float64:
+            img = img.astype(np.float32) / 255.0
         ih, iw = img.shape[:2]
         target = w / h
         if iw / ih > target:  # too wide: crop sides
@@ -185,39 +329,50 @@ def _draw_photo(card: Card, alert: Alert, x, y, w, h, photo_bytes: bytes | None)
         else:
             nh = int(iw / target)
             img = img[(ih - nh) // 2:(ih - nh) // 2 + nh]
-        ax.imshow(img, aspect="auto", interpolation="antialiased")
+        from matplotlib.transforms import Affine2D  # noqa: F401  (keeps matplotlib's image stack loaded)
+
+        # resample mask to the image size
+        mh_, mw_ = img.shape[:2]
+        my = np.linspace(0, 1, mh_)[:, None]
+        mx = np.linspace(0, 1, mw_)[None, :]
+        m = _smooth(mx / 0.07) * _smooth((1 - mx) / 0.07) * _smooth(my / 0.08) * _smooth((1 - my) / 0.3)
+        rgba = np.dstack([img[..., :3], m])
+        card.image(rgba, x, y, x + w, y + h, z=4)
     else:
-        ax.set_xlim(0, 1)
-        ax.set_ylim(0, 1)
-        ax.add_patch(Rectangle((0, 0), 1, 1, fc="#1f252d", ec="#2f3742"))
-        ax.plot([0.5], [0.58], marker=plane_marker(90), markersize=fs(46), color="#3a4554", markeredgewidth=0)
-        ax.text(0.5, 0.16, "NO PHOTO", ha="center", fontsize=fs(7), color=C["faint"], fontweight="bold")
+        glow = np.exp(-(((xs - 0.5) / 0.38) ** 2 + ((ys - 0.48) / 0.42) ** 2)) * 0.16 * mask
+        card.image(_rgba(accent, glow), x, y, x + w, y + h, z=4)
+        card.ov.plot([x + w / 2], [y + h * 0.45], marker=plane_marker(90), markersize=fs(42), color="#ffffff", alpha=0.13, mew=0, zorder=5)
+        card.text(x + w / 2, y + h * 0.86, "NO PHOTO", px=6, color=C["faint"], weight="bold", ha="center")
+
+
+def _fade_rule(card: Card, x0, x1, y, alpha=0.18):
+    xs = np.linspace(0, 1, 200)[None, :]
+    a = np.sin(xs * math.pi) ** 1.5 * alpha
+    card.image(_rgba("#ffffff", a), x0, y - 0.5, x1, y + 0.5, z=4)
 
 
 def _panel(card: Card, alert: Alert, photo_bytes: bytes | None):
     ac = alert.aircraft
     cat = CATEGORIES[alert.top.category]
-    x0, xr = 11, PANEL_W - 9
-    card.text(x0 + 2, 55, _badge_text(alert), px=6.4, color="#111", weight="bold",
-              bbox=dict(boxstyle="round,pad=0.35,rounding_size=0.25", fc=cat["color"], ec="none"))
+    x0, xr = 12, PANEL_W - 12
+    card.pill(x0 + 3, 52, _badge_text(alert), 6.3, "#0b0d10", cat["color"])
     ident = ac.callsign or ac.registration or ac.hex
     card.text(x0, 84, ident, px=17, weight="bold")
     cc, country = geo.country_for_hex(ac.hex)
     if cc:
-        card.text(xr, 79, cc, px=8, weight="bold", ha="right", color=C["text"],
-                  bbox=dict(boxstyle="round,pad=0.3,rounding_size=0.3", fc="none", ec=C["muted"], lw=1))
+        card.pill(xr, 78, cc, 7.4, C["text"], "#ffffff", bg_alpha=0.09, ha="right")
     desc = ac.description or ac.type_code or "Unknown type"
     card.text(x0, 103, textwrap.shorten(nice_desc(desc), 34, placeholder="…"), px=8, color="#d9dee4")
     sub = " · ".join(s for s in (ac.operator, country, "Military" if ac.military else "") if s)
     card.text(x0, 117, textwrap.shorten(sub or "Operator unknown", 40, placeholder="…"), px=6.8, color=C["muted"])
 
-    _draw_photo(card, alert, x0, 128, xr - x0, 112, photo_bytes)
+    _draw_photo(card, alert, x0 - 4, 125, xr - x0 + 8, 120, photo_bytes, cat["color"])
     if alert.photo:
-        card.text(x0, 250, textwrap.shorten(f"Photo: {alert.photo.get('photographer') or 'unknown'} / planespotters.net", 46, placeholder="…"),
-                  px=5.8, color=C["muted"])
+        card.text(x0, 252, textwrap.shorten(f"Photo: {alert.photo.get('photographer') or 'unknown'} / planespotters.net", 46, placeholder="…"),
+                  px=5.6, color=C["muted"])
         if alert.photo.get("same_type"):
-            card.text(x0, 260, "Same type — not this airframe", px=5.8, color="#e8c547")
-    card.rect(x0, 268, xr - x0, 0.8, C["rule"])
+            card.text(x0, 261, "Same type — not this airframe", px=5.6, color="#e8c547")
+    _fade_rule(card, x0 - 4, xr + 4, 270)
 
     sq = ac.squawk or "—"
     rows = [
@@ -230,23 +385,19 @@ def _panel(card: Card, alert: Alert, photo_bytes: bytes | None):
         ("TRACK START", _hhmm(ac.track[0].ts) if ac.track else "—", None),
         ("SEEN", _hhmm(ac.seen_ts), None),
     ]
-    y = 284
+    y = 286
     for label, value, color in rows:
-        card.text(x0, y, label, px=5.6, color=C["muted"])
+        card.text(x0, y, label, px=5.5, color=C["muted"])
         card.text(xr, y, value, px=7.6, weight="bold", ha="right", color=color or C["text"])
-        y += 18.2
+        y += 18
 
 
-def _map(card: Card, alert: Alert, sources: dict):
+# ------------------------------------------------------------------ map
+
+
+def _map(card: Card, alert: Alert):
     ac = alert.aircraft
     cat = CATEGORIES[alert.top.category]
-    mx0, my0, mw, mh = MAP_X0, HEADER_H, W - MAP_X0, H - HEADER_H - FOOTER_H
-    ax = card.fig.add_axes([mx0 / W, FOOTER_H / H, mw / W, mh / H], zorder=1)
-    ax.set_facecolor(C["ocean"])
-    ax.set_xticks([])
-    ax.set_yticks([])
-    for s in ax.spines.values():
-        s.set_visible(False)
 
     track = ac.track[:]
     lons = _unwrap([p.lon for p in track] + ([ac.lon] if ac.lon is not None else []))
@@ -260,7 +411,6 @@ def _map(card: Card, alert: Alert, sources: dict):
             lon += 360
         return lon
 
-    pts = list(zip(lons, lats)) or [pos]
     extras = []
     if alert.divert_airport:
         d = alert.divert_airport
@@ -270,55 +420,25 @@ def _map(card: Card, alert: Alert, sources: dict):
             a = alert.route.get(key) or {}
             if a.get("lat") is not None and geo.haversine_km(pos[1], pos[0], a["lat"], a["lon"]) < ROUTE_SHOW_KM:
                 extras.append((key, near(a["lon"]), a["lat"], a))
-    ext = _extent(pts + [(e[1], e[2]) for e in extras], mw / mh)
-    x0, x1, y0, y1 = ext
-    ax.set_xlim(x0, x1)
-    ax.set_ylim(y0, y1)
-    px_per_x = mw / (x1 - x0)  # design px per projected unit
+    m = MapFrame(card, (list(zip(lons, lats)) or [pos]) + [(e[1], e[2]) for e in extras])
+    ax, mw, mh, P = m.ax, m.vw, m.vh, m.P
+    m.land()
 
-    def P(lon, lat):
-        return math.radians(lon), geo.merc_y(lat)
-
-    # land
-    outers, holes, _ = basemap.land()
-    lon_lo, lon_hi = math.degrees(x0), math.degrees(x1)
-    lat_lo, lat_hi = geo.inv_merc_y(y0), geo.inv_merc_y(y1)
-
-    def polys(rings):
-        out = []
-        for ring in rings:
-            rl = [p[0] for p in ring]
-            rt = [p[1] for p in ring]
-            if max(rt) < lat_lo or min(rt) > lat_hi:
-                continue
-            for shift in (-360, 0, 360):
-                if max(rl) + shift < lon_lo or min(rl) + shift > lon_hi:
-                    continue
-                out.append([P(lo + shift, la) for lo, la in ring])
-        return out
-
-    ax.add_collection(PolyCollection(polys(outers), facecolors=C["land"], edgecolors=C["coast"], linewidths=0.7 * SCALE * 0.5, zorder=1))
-    if holes:
-        ax.add_collection(PolyCollection(polys(holes), facecolors=C["ocean"], edgecolors=C["coast"], linewidths=0.6 * SCALE * 0.5, zorder=1))
-
-    def to_px(lon, lat):
-        x, y = P(lon, lat)
-        return (x - x0) * px_per_x, (y1 - y) * px_per_x  # px from map top-left
-
-    track_px = [to_px(lo, la) for lo, la in zip(lons, lats)]
-    apx, apy = to_px(*pos)
-    extra_px = [to_px(lon, lat) for _, lon, lat, _ in extras]
+    track_px = [m.to_px(lo, la) for lo, la in zip(lons, lats)]
+    apx, apy = m.to_px(*pos)
+    extra_px = [m.to_px(lon, lat) for _, lon, lat, _ in extras]
     divert = next((e for e in extras if e[0] == "divert"), None)
     if divert:  # the dashed line to the diversion airport
-        ex, ey = to_px(divert[1], divert[2])
+        ex, ey = m.to_px(divert[1], divert[2])
         extra_px += [(apx + (ex - apx) * k / 12, apy + (ey - apy) * k / 12) for k in range(1, 12)]
-    blocked = _signals(card, ax, alert, mw, mh, track_px + extra_px + [(apx, apy)] * 25)
+    blocked = [(-80, -20, 0, mh + 20)]  # under the panel fade
+    blocked += _signals(card, m, alert, track_px + extra_px + [(apx, apy)] * 25)
 
     # airport labels go on the side away from the aircraft; reserve their space
     extra_labels = []
     for kind, lon, lat, a in extras:
         code = a.get("icao") or a.get("iata") or ""
-        ex, ey = to_px(lon, lat)
+        ex, ey = m.to_px(lon, lat)
         if kind == "divert":
             name = textwrap.shorten(a.get("name") or a.get("location") or "", 26, placeholder="…")
             dist = geo.haversine_km(pos[1], pos[0], lat, lon)
@@ -327,15 +447,17 @@ def _map(card: Card, alert: Alert, sources: dict):
             place = textwrap.shorten(a.get("city") or a.get("location") or "", 16, placeholder="…")
             text, size = ("FROM " if kind == "origin" else "TO ") + code + (f" · {place}" if place else ""), 6
         side = "right" if ex < apx else "left"  # = the text's horizontal alignment
-        w = max(len(t) for t in text.split("\n")) * size * 0.62 + 12
+        w = max(card.measure(t, size, "bold") for t in text.split("\n")) + 12
         h = size * 1.5 * (text.count("\n") + 1) + 6
         blocked.append((ex - w, ey - 2, ex + 4, ey + h) if side == "right" else (ex - 4, ey - 2, ex + w, ey + h))
         extra_labels.append((text, side))
 
-    desc = textwrap.shorten(nice_desc(ac.description or ac.type_code or ac.label), 30, placeholder="…")
-    label_text = desc if alert.top.category == "watch" else f"{desc}\n{_badge_text(alert)}"
-    label_pos, label_rect = _place_label(label_text, apx, apy, mw, mh, track_px + extra_px * 3, blocked)
-    blocked.append(label_rect)
+    title = textwrap.shorten(nice_desc(ac.description or ac.type_code or ac.label), 30, placeholder="…")
+    sub = "" if alert.top.category == "watch" else _badge_text(alert)
+    lw_ = max(card.measure(title, 7.6, "bold"), card.measure(sub, 6, "bold") if sub else 0) + 18
+    lh_ = 32 if sub else 20
+    lrect = _place_label(lw_, lh_, apx, apy, mw, mh, track_px + extra_px * 3, blocked)
+    blocked.append(lrect)
 
     # cities: biggest first, keep labels apart and off the aircraft, track, airports and overlays
     taken = [(apx, apy)] + [(ex - 30, ey) for ex, ey in extra_px[: len(extras)]]
@@ -344,10 +466,8 @@ def _map(card: Card, alert: Alert, sources: dict):
         if shown >= 16:
             break
         lon = near(lon)
-        if not (lon_lo < lon < lon_hi and lat_lo < lat < lat_hi):
-            continue
-        cx, cy = to_px(lon, lat)
-        if cx > mw - 70 or cy < 30 or cy > mh - 34:
+        cx, cy = m.to_px(lon, lat)
+        if not (0 < cx < mw - 70 and 26 < cy < mh - 34):
             continue
         if any(abs(cx - tx) < 62 and abs(cy - ty) < 16 for tx, ty in taken):
             continue
@@ -357,9 +477,9 @@ def _map(card: Card, alert: Alert, sources: dict):
             continue
         taken.append((cx, cy))
         x, y = P(lon, lat)
-        ax.plot([x], [y], "o", ms=2.2 * SCALE * 0.72, color=C["city"], zorder=3)
-        ax.annotate(name, (x, y), xytext=(4 * SCALE * 0.72, 3 * SCALE * 0.72), textcoords="offset points",
-                    fontsize=fs(6.6), color=C["city"], zorder=3)
+        ax.plot([x], [y], "o", ms=2.1 * PT, color=C["city"], alpha=0.75, mew=0, zorder=3)
+        ax.annotate(name, (x, y), xytext=(4 * PT, 3 * PT), textcoords="offset points", fontsize=fs(6.5), color=C["city"],
+                    alpha=0.85, zorder=3, path_effects=HALO)
         shown += 1
 
     # planned route airports, diversion target
@@ -367,79 +487,91 @@ def _map(card: Card, alert: Alert, sources: dict):
         x, y = P(lon, lat)
         k = 1 if side == "left" else -1
         if kind == "divert":
-            ax.plot([P(*pos)[0], x], [P(*pos)[1], y], ls=(0, (4, 3)), lw=1.4 * SCALE * 0.72, color=cat["color"], zorder=4)
-            ax.plot([x], [y], marker="^", ms=6 * SCALE * 0.72, color=cat["color"], mec="#111", mew=0.8, zorder=6)
+            dx, dy = P(*pos)
+            ax.plot([dx, x], [dy, y], lw=5 * PT, color=cat["color"], alpha=0.1, solid_capstyle="round", zorder=4)
+            ax.plot([dx, x], [dy, y], ls=(0, (3, 2.5)), lw=1.3 * PT, color=cat["color"], alpha=0.9, zorder=4)
+            m.glow_dot(lon, lat, cat["color"], 11, z=5)
+            ax.plot([x], [y], marker="^", ms=5.5 * PT, color=cat["color"], mew=0, zorder=6)
             ax.annotate(text, (x, y), xytext=(9 * k, -5), textcoords="offset points", fontsize=fs(6.4), color=cat["color"],
-                        fontweight="bold", va="top", ha=side, zorder=6, bbox=dict(boxstyle="round,pad=0.25", fc="#0d1014", ec="none", alpha=0.75))
+                        fontweight="bold", va="top", ha=side, zorder=6, path_effects=[pe.withStroke(linewidth=3, foreground=C["bg"], alpha=0.85)])
         else:
-            ax.plot([x], [y], marker="^", ms=4.5 * SCALE * 0.72, color=C["muted"], mec="#111", mew=0.6, zorder=5)
+            ax.plot([x], [y], marker="^", ms=4.3 * PT, color=C["muted"], alpha=0.9, mew=0, zorder=5)
             ax.annotate(text, (x, y), xytext=(7 * k, -3), textcoords="offset points", fontsize=fs(6), color=C["muted"],
-                        va="top", ha=side, zorder=5)
+                        va="top", ha=side, zorder=5, path_effects=HALO)
 
-    # track coloured by altitude
+    # track coloured by altitude: glow underneath, and older parts fade out
     if len(track) >= 2:
         xy = [P(lo, la) for lo, la in zip(lons[: len(track)], lats[: len(track)])]
         segs = [[xy[i], xy[i + 1]] for i in range(len(xy) - 1)]
-        cols = [ALT_CMAP(alt_frac(track[i + 1].alt_ft)) for i in range(len(segs))]
-        ax.add_collection(LineCollection(segs, colors="#000000", linewidths=3.6 * SCALE * 0.72, alpha=0.55, zorder=7, capstyle="round"))
-        ax.add_collection(LineCollection(segs, colors=cols, linewidths=2.0 * SCALE * 0.72, zorder=8, capstyle="round"))
-        ax.plot([xy[0][0]], [xy[0][1]], "o", ms=4 * SCALE * 0.72, mfc="none", mec=cols[0], mew=1.2, zorder=8)
+        n = len(segs)
+        base = [ALT_CMAP(alt_frac(track[i + 1].alt_ft)) for i in range(n)]
+        age = [0.22 + 0.78 * _smooth(np.array(i / max(1, n - 1))) for i in range(n)]
+        for lw, a in ((11, 0.05), (6.5, 0.1), (3.8, 0.22)):
+            ax.add_collection(LineCollection(segs, colors=[(c[0], c[1], c[2], a * f) for c, f in zip(base, age)],
+                                             linewidths=lw * PT, capstyle="butt", zorder=7))
+        ax.add_collection(LineCollection(segs, colors=[(c[0], c[1], c[2], f) for c, f in zip(base, age)],
+                                         linewidths=1.9 * PT, capstyle="butt", zorder=8))
+        ax.plot([xy[0][0]], [xy[0][1]], "o", ms=3.4 * PT, color=base[0], alpha=0.45, mew=0, zorder=8)
 
-    # aircraft
+    # aircraft: soft halo, shadow, icon
     px, py = P(*pos)
-    ax.plot([px], [py], "o", ms=17 * SCALE * 0.72, mfc="none", mec=cat["color"], mew=1.2, alpha=0.55, zorder=9)
-    ax.plot([px], [py], marker=plane_marker(ac.heading), ms=13 * SCALE * 0.72, color=cat["color"], mec="#ffffff", mew=0.7, zorder=10)
+    m.glow_dot(pos[0], pos[1], cat["color"], 20, z=9)
+    shadow_off = 1.5 / m.ppx
+    ax.plot([px + shadow_off], [py - shadow_off], marker=plane_marker(ac.heading), ms=13 * PT, color="#000000", alpha=0.45, mew=0, zorder=9.5)
+    ax.plot([px], [py], marker=plane_marker(ac.heading), ms=13 * PT, color=cat["color"], mec="#ffffff", mew=0.35, zorder=10)
 
-    # label box, on whichever side is clearest
-    lx, ly, lha, lva = label_pos
-    ax.annotate(label_text, (px, py), xytext=(lx * SCALE * 0.72, -ly * SCALE * 0.72), textcoords="offset points",
-                ha=lha, va=lva, multialignment="center", fontsize=fs(7.2), fontweight="bold", color="#14181d", zorder=11, linespacing=1.25,
-                bbox=dict(boxstyle="round,pad=0.45,rounding_size=0.3", fc="#f4f5ef", ec=cat["color"], lw=1.2))
+    # label: frosted glass, a faint leader line to the aircraft
+    lx0, ly0, lx1, ly1 = lrect
+    cxl, cyl = min(max(apx, lx0), lx1), min(max(apy, ly0), ly1)
+    if math.hypot(cxl - apx, cyl - apy) > 14:
+        a0, a1 = m.axc(apx, apy), m.axc(cxl, cyl)
+        ax.plot([a0[0], a1[0]], [a0[1], a1[1]], transform=ax.transAxes, color="#ffffff", alpha=0.22, lw=0.8 * PT, zorder=10.5)
+    m.glass(lx0, ly0, lx1 - lx0, ly1 - ly0, alpha=0.84, z=11)
+    m.text(lx0 + 9, ly0 + 11, title, 7.6, C["text"], z=11.5, fontweight="bold", va="center")
+    if sub:
+        m.text(lx0 + 9, ly0 + 23, sub, 6, cat["color"], z=11.5, fontweight="bold", va="center")
 
-    _scale_bar(ax, ext, mw, mh)
-    _alt_legend(ax, mw, mh)
+    _scale_bar(m)
+    _alt_legend(m)
 
 
-def _signals(card: Card, ax, alert: Alert, mw, mh, avoid_px) -> list[tuple]:
-    """Chips for every kind of flag, plus the most relevant ACARS message.
-    Returns the rectangles (design px from map top-left) it covered."""
-    def axc(px, py):  # design px from map top-left -> axes fraction
-        return px / mw, 1 - py / mh
-
+def _signals(card: Card, m: MapFrame, alert: Alert, avoid_px) -> list[tuple]:
+    """Tinted chips for every kind of flag, plus the most relevant ACARS message.
+    Returns the rectangles (visible-area px) it covered."""
+    mw, mh = m.vw, m.vh
     blocked = []
-    x = 10
+    x = 6
     order = {"squawk": 0, "adsb-emergency": 1, "acars": 2, "route": 3}
     best: dict[str, Flag] = {}
     for f in sorted(alert.flags, key=lambda f: order.get(f.origin, 9)):
         best.setdefault(f.category, f)
     chips = sorted(best.values(), key=lambda f: -CATEGORIES[f.category]["severity"]) if len(best) > 1 else []
     for f in chips:
-        chip = f"{'ACARS' if f.origin == 'acars' else 'SQK ' + f.matched if f.origin == 'squawk' else 'ADS-B'} · {CATEGORIES[f.category]['label']}"
-        t = ax.text(*axc(x, 14), chip, transform=ax.transAxes, fontsize=fs(5.8), fontweight="bold", color="#111", va="center", zorder=12,
-                    bbox=dict(boxstyle="round,pad=0.3,rounding_size=0.25", fc=CATEGORIES[f.category]["color"], ec="none"))
-        w = t.get_window_extent(card.renderer).width / SCALE
-        x += w + 10
+        color = CATEGORIES[f.category]["color"]
+        src = "ACARS" if f.origin == "acars" else f"SQK {f.matched}" if f.origin == "squawk" else "ROUTE" if f.origin == "route" else "ADS-B"
+        label = f"{src} · {CATEGORIES[f.category]['label']}"
+        m.text(x, 8, label, 5.8, color, z=12, fontweight="bold", va="center",
+               bbox=dict(boxstyle="round,pad=0.45,rounding_size=0.8", fc=color, ec="none", alpha=0.16))
+        x += card.measure(label, 5.8, "bold") + 16
         if x > mw - 120:
             break
     if chips:
-        blocked.append((0, 0, x, 24))
+        blocked.append((0, -6, x, 18))
 
     msg_flag = next((f for f in sorted(alert.flags, key=lambda f: -CATEGORIES[f.category]["severity"]) if f.origin == "acars"), None)
     if not msg_flag:
         return blocked
-    msg = next((m for m in alert.messages if m.ts == msg_flag.ts), alert.messages[0] if alert.messages else None)
-    text = msg.text if msg else msg_flag.evidence
-    flat = " ".join(text.split())
+    msg = next((mm for mm in alert.messages if mm.ts == msg_flag.ts), alert.messages[0] if alert.messages else None)
+    flat = " ".join((msg.text if msg else msg_flag.evidence).split())
     lines = textwrap.wrap(flat, 60)
-    if len(lines) > 5:
-        # keep the lines around the match
+    if len(lines) > 5:  # keep the lines around the match
         i = next((n for n, ln in enumerate(lines) if msg_flag.matched and msg_flag.matched.upper() in ln.upper()), 0)
         start = max(0, min(i - 1, len(lines) - 5))
         lines = (["…"] if start else []) + lines[start:start + 5] + (["…"] if start + 5 < len(lines) else [])
-    box_w, line_h = 268, 9.5
-    box_h = 20 + line_h * len(lines) + 4
-    top = 28 if chips else 10
-    corners = [(10, top), (mw - 10 - box_w, top), (10, mh - 36 - box_h), (mw - 10 - box_w, mh - 40 - box_h)]
+    box_w, line_h = 272, 9.5
+    box_h = 22 + line_h * len(lines) + 6
+    top = 24 if chips else 6
+    corners = [(6, top), (mw - 10 - box_w, top), (6, mh - 34 - box_h), (mw - 10 - box_w, mh - 38 - box_h)]
 
     def overlap(c):
         cx, cy = c
@@ -447,86 +579,85 @@ def _signals(card: Card, ax, alert: Alert, mw, mh, avoid_px) -> list[tuple]:
 
     bx, by = min(corners, key=overlap)
     blocked.append((bx, by, bx + box_w, by + box_h))
-    ax.add_patch(FancyBboxPatch(axc(bx, by + box_h), box_w / mw, box_h / mh, transform=ax.transAxes,
-                                boxstyle="round,pad=0,rounding_size=0.008", fc="#0d1014", ec="#39414b", lw=1, alpha=0.92, zorder=12))
+    m.glass(bx, by, box_w, box_h, alpha=0.8, z=12)
     head = "ACARS"
     if msg:
         bits = [_hhmm(msg.ts), msg.flight or msg.registration, f"label {msg.label}" if msg.label else "", msg.source]
-        head += " · " + " · ".join(b for b in bits if b)
-    ax.text(*axc(bx + 8, by + 12), head, transform=ax.transAxes, fontsize=fs(5.8), color=C["muted"], fontweight="bold", zorder=13, va="center")
-    mono = dict(fontsize=fs(6.3), family="DejaVu Sans Mono", zorder=13, transform=ax.transAxes, va="center")
-    probe = ax.text(0, 0, "M" * 10, **mono)
-    char_w = probe.get_window_extent(card.renderer).width / 10 / SCALE
-    probe.remove()
+        head += "  ·  " + "  ·  ".join(b for b in bits if b)
     color = CATEGORIES[msg_flag.category]["color"]
+    m.text(bx + 10, by + 12, "●", 5, color, z=13, va="center")
+    m.text(bx + 18, by + 12, head, 5.7, C["muted"], z=13, fontweight="bold", va="center")
+    mono = dict(family="DejaVu Sans Mono", va="center")
+    char_w = card.measure("M" * 20, 6.3, family="DejaVu Sans Mono") / 20
     for n, ln in enumerate(lines):
-        y = by + 24 + n * line_h
-        ax.text(*axc(bx + 8, y), ln, color="#d6dbe0", **mono)
+        y = by + 27 + n * line_h
+        m.text(bx + 10, y, ln, 6.3, "#d3d9df", z=13, **mono)
         if msg_flag.matched:
             i = ln.upper().find(msg_flag.matched.upper())
             if i >= 0:
-                seg = ln[i:i + len(msg_flag.matched)]
-                ax.text(*axc(bx + 8 + i * char_w, y), seg, color="#111", fontweight="bold",
-                        bbox=dict(boxstyle="square,pad=0.08", fc=color, ec="none"), **mono)
+                m.text(bx + 10 + i * char_w, y, ln[i:i + len(msg_flag.matched)], 6.3, "#0b0d10", z=13.5, fontweight="bold",
+                       bbox=dict(boxstyle="round,pad=0.12,rounding_size=0.3", fc=color, ec="none"), **mono)
     return blocked
 
 
-def _place_label(text: str, apx, apy, mw, mh, avoid_px, blocked):
-    """Pick below/above/right/left of the aircraft, whichever covers the least.
-    Returns ((dx, dy, ha, va), rect) in design px; dy grows downward."""
-    lines = text.split("\n")
-    bw = max(len(ln) for ln in lines) * 4.7 + 14
-    bh = 11 * len(lines) + 8
-    gap = 24
+def _place_label(bw, bh, apx, apy, mw, mh, avoid_px, blocked):
+    """Rect (x0, y0, x1, y1) below/above/right/left of the aircraft, whichever covers the least."""
+    gap = 22
     cands = [
-        ((0, gap, "center", "top"), (apx - bw / 2, apy + gap, apx + bw / 2, apy + gap + bh)),
-        ((0, -gap, "center", "bottom"), (apx - bw / 2, apy - gap - bh, apx + bw / 2, apy - gap)),
-        ((gap, 0, "left", "center"), (apx + gap, apy - bh / 2, apx + gap + bw, apy + bh / 2)),
-        ((-gap, 0, "right", "center"), (apx - gap - bw, apy - bh / 2, apx - gap, apy + bh / 2)),
+        (apx - bw / 2, apy + gap, apx + bw / 2, apy + gap + bh),
+        (apx - bw / 2, apy - gap - bh, apx + bw / 2, apy - gap),
+        (apx + gap, apy - bh / 2, apx + gap + bw, apy + bh / 2),
+        (apx - gap - bw, apy - bh / 2, apx - gap, apy + bh / 2),
+        (apx + gap * 0.7, apy + gap * 0.7, apx + gap * 0.7 + bw, apy + gap * 0.7 + bh),
+        (apx - gap * 0.7 - bw, apy - gap * 0.7 - bh, apx - gap * 0.7, apy - gap * 0.7),
     ]
 
     def cost(rect):
         x0, y0, x1, y1 = rect
         c = sum(1 for px, py in avoid_px if x0 - 6 < px < x1 + 6 and y0 - 6 < py < y1 + 6)
-        c += 1000 * (x0 < 2 or y0 < 26 or x1 > mw - 2 or y1 > mh - 34)
+        c += 1000 * (x0 < 2 or y0 < 20 or x1 > mw - 4 or y1 > mh - 34)
         c += sum(500 for b in blocked if x0 < b[2] and x1 > b[0] and y0 < b[3] and y1 > b[1])
         return c
 
-    return min(cands, key=lambda c: cost(c[1]))
+    return min(cands, key=cost)
 
 
-def _scale_bar(ax, ext, mw, mh):
-    x0, x1, y0, y1 = ext
+def _scale_bar(m: MapFrame):
+    x0, x1, y0, y1 = m.ext
     lat_c = geo.inv_merc_y((y0 + y1) / 2)
-    km_per_unit = 6371.0 * math.cos(math.radians(lat_c))
-    km_map = (x1 - x0) * km_per_unit
+    km_map = (x1 - x0) * 6371.0 * math.cos(math.radians(lat_c))
     nice = next((n for n in (10, 20, 25, 50, 100, 200, 250, 500, 1000, 2000, 2500, 5000) if n >= km_map / 6), 5000)
-    frac = nice / km_map
-    bx, by = 18 / mw, 14 / mh
-    ax.plot([bx, bx + frac], [by, by], transform=ax.transAxes, color="#e6e9ed", lw=1.2, zorder=12, solid_capstyle="butt")
-    for xx in (bx, bx + frac):
-        ax.plot([xx, xx], [by - 3 / mh, by + 3 / mh], transform=ax.transAxes, color="#e6e9ed", lw=1.2, zorder=12)
-    ax.text(bx + frac / 2, by + 6 / mh, f"{nice:,} km", transform=ax.transAxes, ha="center", fontsize=fs(6), color="#e6e9ed", zorder=12)
+    w = nice / km_map * m.vw
+    bx, by = 12, m.vh - 12
+    a0, a1 = m.axc(bx, by), m.axc(bx + w, by)
+    for lw, a in ((4, 0.12), (1.1, 0.75)):
+        m.ax.plot([a0[0], a1[0]], [a0[1], a1[1]], transform=m.ax.transAxes, color="#e6e9ed", lw=lw * PT * 0.6, alpha=a,
+                  solid_capstyle="round", zorder=12)
+    m.text(bx + w / 2, by - 7, f"{nice:,} km", 5.8, "#e6e9ed", z=12, ha="center", alpha=0.85, path_effects=HALO)
 
 
-def _alt_legend(ax, mw, mh):
-    seg_w, h = 29, 5
-    x_end = mw - 12
-    x_start = x_end - seg_w * (len(ALT_COLORS) - 1)
-    y = 10
-    for i in range(len(ALT_COLORS) - 1):
-        for k in range(6):  # small gradient steps inside each segment
-            f0 = (i + k / 6) / (len(ALT_COLORS) - 1)
-            ax.add_patch(Rectangle(((x_start + seg_w * (i + k / 6)) / mw, y / mh), seg_w / 6 / mw, h / mh, transform=ax.transAxes,
-                                   fc=ALT_CMAP(f0), ec="none", zorder=12))
-    labels = ["0", "4k", "8k", "20k", "40k"]
-    for i, lab in enumerate(labels):
-        ax.text((x_start + seg_w * i) / mw, (y + h + 3) / mh, lab, transform=ax.transAxes, ha="center", fontsize=fs(5.4), color="#dfe3e8", zorder=12)
-    ax.text((x_start - 8) / mw, (y + 1) / mh, "ft", transform=ax.transAxes, ha="right", fontsize=fs(5.4), color="#dfe3e8", zorder=12)
+def _alt_legend(m: MapFrame):
+    w, h = 118, 4.5
+    x1 = m.vw - 12
+    x0 = x1 - w
+    y = m.vh - 13
+    xs = np.linspace(0, 1, 256)[None, :] * np.ones((8, 1))
+    img = ALT_CMAP(xs)
+    img[..., 3] = _smooth(xs / 0.06) * _smooth((1 - xs) / 0.06) * 0.95
+    (ax0, ay0), (ax1, ay1) = m.axc(x0, y + h / 2), m.axc(x1, y - h / 2)
+    m.ax.imshow(img, extent=(ax0, ax1, ay0, ay1), transform=m.ax.transAxes, aspect="auto", interpolation="bilinear", zorder=12)
+    m.ax.set_xlim(m.X0, m.X1)
+    m.ax.set_ylim(m.Y0, m.Y1)
+    for i, lab in enumerate(["0", "4k", "8k", "20k", "40k"]):
+        m.text(x0 + w * i / 4, y - 7, lab, 5.3, "#dfe3e8", z=12, ha="center", alpha=0.85, path_effects=HALO)
+    m.text(x0 - 7, y, "ft", 5.3, "#dfe3e8", z=12, ha="right", va="center", alpha=0.85)
+
+
+# ------------------------------------------------------------------ public
 
 
 def render_card(alert: Alert, path, photo_bytes: bytes | None = None, title: str = "PLANE ALERT",
-                brand: str = "hybrid war tracker", sources: dict | None = None, sample: bool = False):
+                brand: str = "plane watch", sources: dict | None = None, sample: bool = False):
     sources = sources or {}
     cat = CATEGORIES[alert.top.category]
     card = Card(title, brand)
@@ -538,67 +669,48 @@ def render_card(alert: Alert, path, photo_bytes: bytes | None = None, title: str
     when = datetime.fromtimestamp(alert.aircraft.seen_ts or 0, timezone.utc).strftime("%d %b %Y · %H:%M UTC")
     card.chrome(cat["color"], " · ".join(parts), when, sample)
     _panel(card, alert, photo_bytes)
-    _map(card, alert, sources)
+    _map(card, alert)
     card.save(path)
     return path
 
 
-def render_overview(alerts: list[Alert], path, title: str = "PLANE ALERT", brand: str = "hybrid war tracker",
+def render_overview(alerts: list[Alert], path, title: str = "PLANE ALERT", brand: str = "plane watch",
                     when_ts: float | None = None, sample: bool = False):
-    """One picture of every current alert: list on the left, dots on a world map."""
+    """One picture of every current alert: list on the left, glowing markers on a world map."""
     card = Card(title, brand)
     worst = max(alerts, key=lambda a: CATEGORIES[a.top.category]["severity"]) if alerts else None
     accent = CATEGORIES[worst.top.category]["color"] if worst else "#5ac8a8"
     when_ts = when_ts or max((a.aircraft.seen_ts or 0 for a in alerts), default=0) or datetime.now(timezone.utc).timestamp()
     when = datetime.fromtimestamp(when_ts, timezone.utc).strftime("%d %b %Y · %H:%M UTC")
     card.chrome(accent, f"{len(alerts)} flagged aircraft · position: ADS-B community feeds · map: Natural Earth · {brand}", when, sample)
-    card.text(11, 58, "ACTIVE ALERTS", px=6.4, color="#111", weight="bold",
-              bbox=dict(boxstyle="round,pad=0.35,rounding_size=0.25", fc=accent, ec="none"))
-    y = 80
+    card.pill(15, 54, f"{len(alerts)} ACTIVE ALERT{'S' if len(alerts) != 1 else ''}", 6.3, "#0b0d10", accent)
+    y = 82
     ranked = sorted(alerts, key=lambda a: -CATEGORIES[a.top.category]["severity"])
-    for a in ranked[:17]:
+    for a in ranked[:16]:
         cat = CATEGORIES[a.top.category]
-        card.rect(11, y - 8, 3, 11, cat["color"])
-        card.text(19, y, a.aircraft.label, px=7.6, weight="bold")
-        card.text(PANEL_W - 9, y, textwrap.shorten(cat["label"], 22, placeholder="…"), px=5.6, color=cat["color"], ha="right", weight="bold")
-        card.text(19, y + 9, textwrap.shorten(nice_desc(a.aircraft.description or a.aircraft.type_code or a.aircraft.hex), 36, placeholder="…"), px=5.6, color=C["muted"])
-        y += 20.5
-    if len(ranked) > 17:
-        card.text(19, y, f"+ {len(ranked) - 17} more", px=6, color=C["muted"])
+        card.ov.plot([16], [y - 3], "o", ms=4 * PT, color=cat["color"], mew=0, zorder=6)
+        card.ov.plot([16], [y - 3], "o", ms=9 * PT, color=cat["color"], alpha=0.18, mew=0, zorder=6)
+        card.text(25, y, a.aircraft.label, px=7.6, weight="bold")
+        card.text(PANEL_W - 12, y, textwrap.shorten(cat["label"], 22, placeholder="…"), px=5.5, color=cat["color"], ha="right", weight="bold")
+        card.text(25, y + 9, textwrap.shorten(nice_desc(a.aircraft.description or a.aircraft.type_code or a.aircraft.hex), 36, placeholder="…"),
+                  px=5.6, color=C["muted"])
+        y += 21
+    if len(ranked) > 16:
+        card.text(25, y, f"+ {len(ranked) - 16} more", px=6, color=C["muted"])
     if not alerts:
-        card.text(19, 84, "Nothing flagged right now.", px=7, color=C["muted"])
+        card.text(15, 84, "Nothing flagged right now.", px=7, color=C["muted"])
 
-    mw, mh = W - MAP_X0, H - HEADER_H - FOOTER_H
-    ax = card.fig.add_axes([MAP_X0 / W, FOOTER_H / H, mw / W, mh / H], zorder=1)
-    ax.set_facecolor(C["ocean"])
-    ax.set_xticks([])
-    ax.set_yticks([])
-    for s in ax.spines.values():
-        s.set_visible(False)
     pts = [(a.aircraft.lon, a.aircraft.lat) for a in alerts if a.aircraft.lat is not None]
-    x0, x1, y0, y1 = _extent(pts or [(-150, -50), (170, 70)], mw / mh, min_span_deg=60 if pts else 320)
-    y0, y1 = max(y0, geo.merc_y(-75)), min(y1, geo.merc_y(80))
-    ax.set_xlim(x0, x1)
-    ax.set_ylim(y0, y1)
-    outers, holes, _ = basemap.land()
-    proj = []
-    for ring in outers:
-        for shift in (-360, 0, 360):
-            r = [(math.radians(lo + shift), geo.merc_y(la)) for lo, la in ring]
-            if max(p[0] for p in r) >= x0 and min(p[0] for p in r) <= x1:
-                proj.append(r)
-    ax.add_collection(PolyCollection(proj, facecolors=C["land"], edgecolors=C["coast"], linewidths=0.6))
-    if holes:
-        ax.add_collection(PolyCollection([[(math.radians(lo), geo.merc_y(la)) for lo, la in r] for r in holes],
-                                         facecolors=C["ocean"], edgecolors=C["coast"], linewidths=0.5))
+    m = MapFrame(card, pts or [(-150, -50), (170, 70)], min_span_deg=60 if pts else 320, clamp_lat=(-70, 80))
+    m.land()
     for a in alerts:
         if a.aircraft.lat is None:
             continue
         cat = CATEGORIES[a.top.category]
-        x, y = math.radians(a.aircraft.lon), geo.merc_y(a.aircraft.lat)
-        ax.plot([x], [y], "o", ms=16, mfc="none", mec=cat["color"], mew=1.2, alpha=0.5, zorder=5)
-        ax.plot([x], [y], marker=plane_marker(a.aircraft.heading), ms=13, color=cat["color"], mec="white", mew=0.6, zorder=6)
-        ax.annotate(a.aircraft.label, (x, y), xytext=(9, 6), textcoords="offset points", fontsize=fs(6.4), color=C["text"],
-                    fontweight="bold", zorder=7, bbox=dict(boxstyle="round,pad=0.25", fc="#0d1014", ec=cat["color"], lw=0.8, alpha=0.85))
+        x, y_ = m.P(a.aircraft.lon, a.aircraft.lat)
+        m.glow_dot(a.aircraft.lon, a.aircraft.lat, cat["color"], 16, z=5)
+        m.ax.plot([x], [y_], marker=plane_marker(a.aircraft.heading), ms=11 * PT, color=cat["color"], mec="#ffffff", mew=0.3, zorder=6)
+        m.ax.annotate(a.aircraft.label, (x, y_), xytext=(9 * PT, 5 * PT), textcoords="offset points", fontsize=fs(6.4), color=C["text"],
+                      fontweight="bold", zorder=7, bbox=dict(boxstyle="round,pad=0.4,rounding_size=0.6", fc=C["glass"], ec="none", alpha=0.78))
     card.save(path)
     return path

@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       squawks:
-        description: "Squawk codes to look for, comma-separated (7400 UAV lost link and 7777 US intercept also work)"
+        description: "Squawk codes to look for, comma-separated (default: all of them)"
         required: false
-        default: "7500,7600,7700"
+        default: "7500,7600,7700,7400,7777"
       watch_minutes:
         description: "Keep polling this many minutes to build live tracks (0 = one snapshot)"
         required: false
@@ -54,7 +54,7 @@ jobs:
 
       - name: Scan
         env:
-          SQUAWKS: ${{ inputs.squawks || '7500,7600,7700' }}
+          SQUAWKS: ${{ inputs.squawks || '7500,7600,7700,7400,7777' }}
           WATCH: ${{ inputs.watch_minutes || '0' }}
           # Optional: ACARS from airframes.io
           AIRFRAMES_API_KEY: ${{ secrets.AIRFRAMES_API_KEY }}

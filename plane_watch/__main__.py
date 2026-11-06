@@ -1,5 +1,6 @@
 """Command line.
 
+  python -m plane_watch          the live app: watch everything, dashboard in the browser
   python -m plane_watch scan     find flagged aircraft now, render cards, save data
   python -m plane_watch render   card for specific aircraft (--hex / --reg / --callsign)
   python -m plane_watch demo     render the built-in sample alerts (offline)
@@ -167,19 +168,24 @@ def cmd_classify(args) -> int:
 
 
 def main(argv=None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    if not argv or argv[0] == "app" or argv[0].startswith("-"):
+        from .app import main as app_main
+
+        return app_main(argv[1:] if argv and argv[0] == "app" else argv)
     p = argparse.ArgumentParser(prog="plane_watch", description="Flag aircraft in trouble from ADS-B + ACARS and render cards.")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     def common(sp):
         sp.add_argument("--out", default="site/planes", help="output folder (default: site/planes)")
         sp.add_argument("--title", default="PLANE ALERT")
-        sp.add_argument("--brand", default="hybrid war tracker")
+        sp.add_argument("--brand", default="plane watch")
         sp.add_argument("--no-photos", action="store_true", help="don't fetch aircraft photos")
         sp.add_argument("--keep-runs", type=int, default=60, help="delete card images older than this many runs")
 
     s = sub.add_parser("scan", help="find flagged aircraft now")
     common(s)
-    s.add_argument("--squawks", default=",".join(classify.DEFAULT_SQUAWKS), help="squawk codes to look for (default 7500,7600,7700)")
+    s.add_argument("--squawks", default=",".join(classify.SQUAWKS), help="squawk codes to look for (default: all, 7500,7600,7700,7400,7777)")
     s.add_argument("--sources", default=",".join(DEFAULT_SOURCES), help="ADS-B APIs: adsb.lol,airplanes.live,adsb.fi")
     s.add_argument("--acars-file", action="append", help="JSON lines from acarsdec/dumpvdl2/dumphfdl/ACARS Hub (repeatable)")
     s.add_argument("--airframes", action="store_true", help="also pull ACARS from airframes.io (needs AIRFRAMES_API_KEY)")

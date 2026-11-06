@@ -14,7 +14,14 @@ from pathlib import Path
 
 from . import http
 
-DATA = Path(__file__).parent / "data"
+
+
+def _data(name: str) -> str:
+    """Bundled data file (works from a folder or from inside the planewatch.pyz zip)."""
+    from importlib.resources import files
+
+    return files(__package__).joinpath("data", name).read_text(encoding="utf-8")
+
 NE = "https://raw.githubusercontent.com/nvkelso/natural-earth-vector/v5.1.2/geojson"
 LAND_50M = f"{NE}/ne_50m_land.geojson"
 PLACES_50M = f"{NE}/ne_50m_populated_places_simple.geojson"
@@ -63,7 +70,7 @@ def land() -> tuple[list, list, str]:
             return outers, holes, "Natural Earth"
         except (http.FetchError, OSError, ValueError):
             pass
-    return json.loads((DATA / "land_110m.json").read_text())["rings"], [], "Natural Earth"
+    return json.loads(_data("land_110m.json"))["rings"], [], "Natural Earth"
 
 
 @lru_cache(maxsize=1)
@@ -81,5 +88,5 @@ def cities() -> list[tuple[str, float, float, int]]:
                 return sorted(out, key=lambda c: -c[3])
         except (http.FetchError, OSError, ValueError, KeyError):
             pass
-    data = json.loads((DATA / "cities.json").read_text())
+    data = json.loads(_data("cities.json"))
     return [tuple(c) for c in data["cities"]]

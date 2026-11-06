@@ -1,0 +1,52 @@
+name: Build Plane Watch app
+
+# Publishes dist/planewatch.pyz as a download:
+# https://github.com/Inasjackw321/hybrid-war-tracker/releases/latest/download/planewatch.pyz
+
+on:
+  push:
+    branches: [main]
+    paths: ["plane_watch/**", "planewatch.py", "tools/build_app.py", ".github/workflows/release-app.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-app
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: pip install matplotlib airportsdata
+
+      - name: Test
+        run: python -m unittest -q tests.test_plane_watch
+
+      - name: Build
+        run: python tools/build_app.py
+
+      - name: Smoke test the built file
+        env:
+          PLANE_WATCH_OFFLINE: "1"
+        run: python dist/planewatch.pyz demo --out /tmp/demo && ls /tmp/demo/cards
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete planewatch-latest --yes --cleanup-tag || true
+          gh release create planewatch-latest dist/planewatch.pyz --latest \
+            --title "Plane Watch" \
+            --notes "Download planewatch.pyz and run:  python planewatch.pyz
+          Needs Python 3.9+. The first run installs matplotlib and airportsdata into ~/.planewatch (about a minute), then opens the live dashboard at http://localhost:8787.
+          Built from ${{ github.sha }}."

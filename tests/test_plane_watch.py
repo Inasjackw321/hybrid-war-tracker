@@ -279,3 +279,100 @@ class RenderTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LiveAppTests(unittest.TestCase):
+    def _args(self, out, **kw):
+        from plane_watch.app import parser
+
+        args = parser().parse_args(["--out", out, "--udp-port", "0", "--no-browser", "--sources", "adsb.lol"])
+        for k, v in kw.items():
+            setattr(args, k, v)
+        return args
+
+    def test_two_cycles_extend_track_and_dont_duplicate_history(self):
+        from plane_watch.app import LiveApp
+
+        state = {"lat": 40.1}
+
+        def fake_get(url, headers=None):
+            if "/sqk/7700" in url:
+                data = json.loads(json.dumps(READSB))
+                data["ac"] = data["ac"][:1]
+                data["ac"][0]["lat"] = state["lat"]
+                data["now"] += int((state["lat"] - 40.1) * 1e6)
+                return data
+            if url.endswith("/mil") or "/sqk/" in url:
+                return {"now": READSB["now"], "ac": []}
+            raise adsb.http.FetchError("HTTP 404")
+
+        with tempfile.TemporaryDirectory() as d, \
+                mock.patch.object(adsb.http, "get_json", side_effect=fake_get), \
+                mock.patch.object(adsb.http, "post_json", side_effect=adsb.http.FetchError("x")), \
+                mock.patch.object(adsb.time, "sleep"):
+            app = LiveApp(self._args(d))
+            s1 = app.cycle()
+            state["lat"] = 40.3
+            s2 = app.cycle()
+            self.assertEqual(len(s1["alerts"]), 1)
+            self.assertEqual(s2["alerts"][0]["track_points"], 2)
+            self.assertTrue((Path(d) / "cards" / "A1B2C3.png").exists())
+            self.assertTrue((Path(d) / "cards" / "overview.png").exists())
+            live = json.loads((Path(d) / "data" / "live.json").read_text())
+            self.assertEqual(live["alerts"][0]["category"], "emergency")
+            self.assertEqual(live["squawks"], ["7500", "7600", "7700", "7400", "7777"])
+            with (Path(d) / "data" / "alerts.csv").open() as fh:
+                self.assertEqual(len(list(csv.DictReader(fh))), 1)  # same alert, logged once
+
+            # aircraft stops squawking: moves to "recently cleared"
+            state["lat"] = None
+            with mock.patch.object(adsb.http, "get_json", return_value={"now": READSB["now"], "ac": []}):
+                s3 = app.cycle()
+            self.assertEqual(s3["alerts"], [])
+            self.assertEqual(s3["cleared"][0]["aircraft"]["hex"], "A1B2C3")
+
+    def test_udp_listener_parses_decoder_json(self):
+        import socket
+        import time as _t
+
+        from plane_watch.app import AcarsListener
+
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+        probe.close()
+        listener = AcarsListener(port)
+        listener.start()
+        self.assertEqual(listener.error, "")
+        line = json.dumps({"timestamp": _t.time(), "tail": "N1", "flight": "X1", "text": "BOMB THREAT", "station_id": "a"})
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.sendto(line.encode(), ("127.0.0.1", port))
+        for _ in range(50):
+            if listener.recent():
+                break
+            _t.sleep(0.05)
+        self.assertEqual(listener.recent()[0].text, "BOMB THREAT")
+
+    def test_no_command_runs_app(self):
+        from plane_watch import __main__ as cli
+
+        with mock.patch("plane_watch.app.main", return_value=0) as app_main:
+            self.assertEqual(cli.main([]), 0)
+            cli.main(["--interval", "30"])
+        self.assertEqual(app_main.call_args_list[1].args[0], ["--interval", "30"])
+
+
+class BuildAppTests(unittest.TestCase):
+    def test_pyz_runs_demo(self):
+        import subprocess
+        import sys
+
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
+        from build_app import build
+
+        with tempfile.TemporaryDirectory() as d:
+            pyz = build(Path(d) / "planewatch.pyz")
+            r = subprocess.run([sys.executable, str(pyz), "demo", "--out", str(Path(d) / "out")], capture_output=True, text=True,
+                               env={**os.environ, "PLANE_WATCH_OFFLINE": "1"}, timeout=240)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(len(list((Path(d) / "out" / "cards").glob("*.png"))), 4)
