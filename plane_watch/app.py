@@ -31,7 +31,7 @@ from importlib.resources import files
 from pathlib import Path
 
 from . import classify, pipeline, render, tracker
-from .models import AcarsMessage, Alert, TrackPoint
+from .models import AcarsMessage, Alert, Flag, TrackPoint
 from .sources import acars as acars_src
 from .sources import photos as photo_src
 from .sources.adsb import DEFAULT_SOURCES, AdsbClient
@@ -172,6 +172,18 @@ class QuietHandler(SimpleHTTPRequestHandler):
     def do_GET(self):
         if self.path.startswith("/api/ping"):
             return self._json(200, {"app": "planewatch", "pid": os.getpid(), "paused": bool(self.app and self.app.paused.is_set())})
+        if self.path.startswith("/api/aircraft") and self.app is not None:
+            from urllib.parse import parse_qs, urlsplit
+
+            hex_code = (parse_qs(urlsplit(self.path).query).get("hex") or [""])[0].strip().upper()
+            if not hex_code:
+                return self._json(400, {"error": "hex missing"})
+            try:
+                report = tracker.aircraft_report(self.app.out / "data" / "tracks.sqlite", hex_code)
+            except Exception as e:  # noqa: BLE001
+                return self._json(500, {"error": str(e)})
+            report["watched"] = any(w.get("hex") == hex_code or w["query"] == hex_code for w in self.app.watchlist)
+            return self._json(200, report)
         return super().do_GET()
 
     def do_POST(self):
@@ -180,6 +192,13 @@ class QuietHandler(SimpleHTTPRequestHandler):
         if self.headers.get(CONTROL_HEADER) != "1":
             return self._json(403, {"error": "missing header"})
         action = self.path[len("/api/"):].split("?")[0]
+        if action in ("watch", "unwatch"):
+            try:
+                body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
+            except ValueError:
+                return self._json(400, {"error": "bad JSON"})
+            ok, msg = self.app.edit_watchlist(action, str(body.get("query") or ""))
+            return self._json(200 if ok else 400, {"ok": ok, "message": msg})
         if action not in ("pause", "resume", "check", "stop"):
             return self._json(404, {"error": "unknown action"})
         self.app.control(action)
@@ -234,6 +253,7 @@ class LiveApp:
         self.logged_msgs = set(self.history.get("_acars_logged", []))
         self.history.pop("_acars_logged", None)
         self.locate_cache: dict[str, object] = {}
+        render.WATERMARK = args.watermark
         self.map_recent: dict[str, dict] = self._load("map_recent.json", {})
         self.store = tracker.Store(self.out / "data" / "tracks.sqlite", keep_days=args.record_days)
         self.watch_types = tuple(t.strip().upper() for t in args.watch_types.split(",") if t.strip())
@@ -246,6 +266,11 @@ class LiveApp:
         self.last_status: dict | None = None
         self.client.on_progress = self.progress
         self._last_progress = 0.0
+        self.watchlist: list[dict] = self._load("watchlist.json", [])
+        self.watch_lock = threading.Lock()
+        self.watch_cache: dict[str, dict] = {}  # hex -> {"photo", "photo_bytes", "rendered", "seen"}
+        for q in args.watch or []:
+            self.edit_watchlist("watch", q)
 
     def progress(self, message: str, checking: bool = True):
         """Tell the dashboard what's happening right now (throttled)."""
@@ -303,8 +328,11 @@ class LiveApp:
                 ac.military = True
                 watched.append(ac)
         self._military_now = (len(military), len({ac.hex for ac in watched}))
+        watch_found = self.check_watchlist()
         self.progress(f"Recording {len(military) + len(watched)} military aircraft")
-        self.store.record(military + watched + list(aircraft.values()))
+        self.store.record(military + watched + list(aircraft.values()) + [ac for _, ac in watch_found])
+        if self.backfill and watch_found:
+            self.backfill.add([ac for _, ac in watch_found])
         if self.backfill:  # watched types first, so the Osprey/H-60 map fills in quickly
             self.backfill.add(watched + military)
 
@@ -392,6 +420,7 @@ class LiveApp:
         status["paused"] = self.paused.is_set()
         status["military_now"], status["watched_now"] = getattr(self, "_military_now", (0, 0))
         status["backfill"] = self.backfill.status() if self.backfill else None
+        status["watchlist"] = self.watch_status(watch_found)
         status["squawk_now"] = {sq: sum(1 for a in alerts if a.aircraft.squawk == sq and not a.ground_test) for sq in self.squawks}
         self.last_status = status
         self._write("live.json", status)
@@ -415,7 +444,8 @@ class LiveApp:
             tracker.write_csvs(summ, self.out / "data", key)
             self.progress(f"Drawing the military heatmap ({label})")
             render.render_heatmap(self.store.points(now - hours * 3600), self.out / "cards" / f"military-heatmap-{key}.png",
-                                  summ, label, title=self.args.title, brand=self.args.brand)
+                                  summ, label, title=self.args.title, brand=self.args.brand,
+                                  segments=self.store.segment_chunks(now - hours * 3600))
             out["periods"][key] = {
                 "label": label, "positions": summ["positions"], "aircraft_seen": summ["aircraft_seen"], "flight_count": len(summ["flights"]),
                 "flights": summ["flights"][:400], "airfields": summ["airfields"][:150], "types": summ["types"][:60],
@@ -427,6 +457,101 @@ class LiveApp:
         out["watched"] = [{k: v for k, v in w.items() if k != "track"} for w in watched]
         out["watch_types"] = {t: tracker.WATCH_TYPES.get(t, t) for t in self.watch_types}
         self._write("military.json", out)
+
+    # ------------------------------------------------------------ watchlist
+
+    MAX_WATCH = 25
+
+    @staticmethod
+    def watch_kind(query: str) -> tuple[str, str]:
+        """'AE6808' -> hex, 'N123AB' / 'F-WZFJ' -> registration, anything else -> callsign. 'reg:' / 'cs:' / 'hex:' force it."""
+        import re
+
+        q = query.strip().upper().replace(" ", "")
+        for prefix, kind in (("HEX:", "hex"), ("REG:", "reg"), ("CS:", "callsign"), ("CALLSIGN:", "callsign")):
+            if q.startswith(prefix):
+                return kind, q[len(prefix):]
+        if re.fullmatch(r"[0-9A-F]{6}", q) and re.search(r"\d", q):
+            return "hex", q
+        if "-" in q or re.fullmatch(r"N[1-9]\d{0,4}[A-Z]{0,2}", q):
+            return "reg", q
+        return "callsign", q
+
+    def edit_watchlist(self, action: str, query: str) -> tuple[bool, str]:
+        kind, q = self.watch_kind(query)
+        if not q or len(q) > 12:
+            return False, "Type a hex code, callsign or registration."
+        with self.watch_lock:
+            if action == "watch":
+                if any(w["query"] == q for w in self.watchlist):
+                    return True, f"{q} is already on the watchlist."
+                if len(self.watchlist) >= self.MAX_WATCH:
+                    return False, f"The watchlist is full ({self.MAX_WATCH})."
+                self.watchlist.append({"query": q, "kind": kind, "added": time.time()})
+            else:
+                self.watchlist = [w for w in self.watchlist if w["query"] != q and w.get("hex") != q]
+            self._write("watchlist.json", self.watchlist)
+        self.wake.set()  # check now instead of waiting for the next cycle
+        return True, (f"Watching {q} ({kind})." if action == "watch" else f"Stopped watching {q}.")
+
+    def check_watchlist(self) -> list[tuple[dict, object]]:
+        with self.watch_lock:
+            items = list(self.watchlist)
+        found = []
+        for w in items:
+            self.progress(f"Looking for {w['query']} (watchlist)")
+            ac = self.client.first(w["kind"], w["query"])
+            if ac and ac.lat is not None:
+                w["hex"] = ac.hex
+                found.append((w, ac))
+        with self.watch_lock:
+            for w in self.watchlist:
+                hit = next((x for x, _ in found if x["query"] == w["query"]), None)
+                if hit:
+                    w["hex"] = hit["hex"]
+        return found
+
+    def watch_status(self, found) -> list[dict]:
+        """Status for the dashboard, and a fresh card for each watched aircraft that's visible."""
+        now = time.time()
+        by_query = {w["query"]: ac for w, ac in found}
+        out = []
+        with self.watch_lock:
+            items = list(self.watchlist)
+        info = self.store.aircraft_info()
+        for w in items:
+            ac = by_query.get(w["query"])
+            row = {"query": w["query"], "kind": w["kind"], "added": _iso(w.get("added")), "found": ac is not None, "hex": w.get("hex", "")}
+            if ac is not None:
+                cache = self.watch_cache.setdefault(ac.hex, {})
+                pts = next((p for h, p in self.store.iter_tracks(now - 24 * 3600, ac.hex)), [])
+                ac.track = [TrackPoint(t, la, lo, al) for t, la, lo, al in pts]
+                alert = Alert(ac, [Flag("watch", "On your watchlist", "watch", ac.seen_ts)])
+                if "photo" not in cache and not self.args.no_photos:
+                    alert.photo = cache["photo"] = photo_src.find_photo(ac.hex, ac.registration)
+                    cache["photo_bytes"] = self._photo(alert)
+                alert.photo = cache.get("photo")
+                name = f"cards/watch-{ac.hex}.png"
+                if cache.get("seen") != ac.seen_ts and now - cache.get("rendered", 0) > 110:
+                    self.progress(f"Drawing the card for {ac.label} (watchlist)")
+                    try:
+                        render.render_card(alert, self.out / name, cache.get("photo_bytes"), title=self.args.title, brand=self.args.brand)
+                        cache["rendered"], cache["seen"] = now, ac.seen_ts
+                    except Exception as e:  # noqa: BLE001
+                        self.client.errors.append(f"card for {ac.label}: {e}")
+                near, d = tracker.nearest_airfield(ac.lat, ac.lon, 60)
+                row.update(label=ac.label, callsign=ac.callsign, reg=ac.registration, type=ac.type_code, desc=ac.description,
+                           operator=ac.operator, military=ac.military, alt=0 if ac.on_ground else ac.alt_ft, speed=ac.speed_kt,
+                           heading=ac.heading, lat=ac.lat, lon=ac.lon, squawk=ac.squawk, last_seen=_iso(ac.seen_ts),
+                           card=name if cache.get("rendered") else "", card_v=int(cache.get("rendered", 0)),
+                           near={"icao": near["icao"], "name": near["name"], "km": round(d)} if near else None)
+            else:
+                meta = info.get(w.get("hex", ""), {})
+                row.update(label=meta.get("callsign") or w["query"], desc=meta.get("descr") or "", type=meta.get("type") or "",
+                           last_seen=_iso(meta.get("last_seen")), card=f"cards/watch-{w['hex']}.png" if w.get("hex") and
+                           (self.out / "cards" / f"watch-{w['hex']}.png").exists() else "", card_v=0)
+            out.append(row)
+        return out
 
     def control(self, action: str):
         """Called by the dashboard buttons (and --stop)."""
@@ -639,6 +764,8 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--watch-types", default=",".join(tracker.WATCH_TYPES),
                    help="ICAO aircraft types whose last position is mapped over 24 h (default V22,H60: Ospreys and H-60s)")
     p.add_argument("--record-days", type=float, default=8, help="keep recorded military positions this many days (default 8)")
+    p.add_argument("--watch", action="append", help="add an aircraft to the watchlist (hex, callsign or registration; repeatable)")
+    p.add_argument("--watermark", default="@Kaldockhi", help="text stamped on every graphic (default @Kaldockhi; '' for none)")
     p.add_argument("--backfill-hours", type=float, default=24,
                    help="on start, download this many hours of track history for the military aircraft it sees (0 = off; default 24)")
     p.add_argument("--summary-minutes", type=float, default=10,

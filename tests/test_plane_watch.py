@@ -609,3 +609,83 @@ class BackfillTests(unittest.TestCase):
             self.assertEqual(w[0]["hex"], "AE1111")
             self.assertGreater(len(w[0]["track"]), 150)
             self.assertEqual(app._last_summary, 0)  # summaries get rebuilt
+
+
+class WatchlistTests(unittest.TestCase):
+    def _app(self, d, *extra):
+        from plane_watch.app import LiveApp, parser
+
+        return LiveApp(parser().parse_args(["--out", d, "--udp-port", "0", "--no-browser", "--backfill-hours", "0",
+                                            "--no-photos", *extra]))
+
+    def test_kind_detection(self):
+        from plane_watch.app import LiveApp
+
+        k = LiveApp.watch_kind
+        self.assertEqual(k("ae6808"), ("hex", "AE6808"))
+        self.assertEqual(k("F-WZFJ"), ("reg", "F-WZFJ"))
+        self.assertEqual(k("N123AB"), ("reg", "N123AB"))
+        self.assertEqual(k("RCH123"), ("callsign", "RCH123"))
+        self.assertEqual(k("cs:ABC123"), ("callsign", "ABC123"))
+        self.assertEqual(k("hex:abcdef"), ("hex", "ABCDEF"))
+
+    def test_watch_follow_and_lookup(self):
+        from plane_watch import tracker
+
+        p8 = {"now": READSB["now"], "ac": [{"hex": "ae6808", "flight": "PELICAN1", "r": "169009", "t": "P8", "desc": "BOEING P-8 Poseidon",
+                                            "alt_baro": 14500, "gs": 410, "track": 273, "lat": 4.2, "lon": 73.5, "seen_pos": 1, "dbFlags": 1}]}
+
+        def fake_get(url, headers=None):
+            if "/hex/ae6808" in url or "/hex/AE6808" in url:
+                return p8
+            if url.endswith("/mil") or "/sqk/" in url or "/type/" in url:
+                return {"now": READSB["now"], "ac": []}
+            raise adsb.http.FetchError("HTTP 404")
+
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(adsb.http, "get_json", side_effect=fake_get), \
+                mock.patch.object(adsb.http, "post_json", side_effect=adsb.http.FetchError("x")), mock.patch.object(adsb.time, "sleep"):
+            app = self._app(d, "--watch", "AE6808", "--watch", "RCH999", "--summary-minutes", "1000")
+            self.assertEqual([w["query"] for w in app.watchlist], ["AE6808", "RCH999"])
+            status = app.cycle()
+            w = {x["query"]: x for x in status["watchlist"]}
+            self.assertTrue(w["AE6808"]["found"])
+            self.assertFalse(w["RCH999"]["found"])
+            self.assertEqual(w["AE6808"]["card"], "cards/watch-AE6808.png")
+            self.assertTrue((Path(d) / "cards" / "watch-AE6808.png").exists())
+            report = tracker.aircraft_report(Path(d) / "data" / "tracks.sqlite", "ae6808")
+            self.assertTrue(report["found"])
+            self.assertEqual(report["info"]["type"], "P8")
+            ok, _ = app.edit_watchlist("unwatch", "AE6808")
+            self.assertTrue(ok)
+            self.assertEqual([x["query"] for x in json.loads((Path(d) / "data" / "watchlist.json").read_text())], ["RCH999"])
+
+    def test_watch_api(self):
+        import socket
+        import urllib.request
+
+        from plane_watch.app import CONTROL_HEADER, start_server
+
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        with tempfile.TemporaryDirectory() as d:
+            app = self._app(d)
+            env = {k: v for k, v in os.environ.items() if k != "PLANE_WATCH_OFFLINE"}
+            with mock.patch.dict(os.environ, env, clear=True):
+                got = start_server(Path(d), port, app)
+                req = urllib.request.Request(f"http://127.0.0.1:{got}/api/watch", data=json.dumps({"query": "N123AB"}).encode(),
+                                             method="POST", headers={CONTROL_HEADER: "1", "Content-Type": "application/json"})
+                with urllib.request.urlopen(req, timeout=5) as r:
+                    self.assertTrue(json.loads(r.read())["ok"])
+                with urllib.request.urlopen(f"http://127.0.0.1:{got}/api/aircraft?hex=ABCDEF", timeout=5) as r:
+                    self.assertFalse(json.loads(r.read())["found"])
+            self.assertEqual(app.watchlist[0]["kind"], "reg")
+
+    def test_watermark_option(self):
+        from plane_watch import render
+
+        with tempfile.TemporaryDirectory() as d:
+            self._app(d, "--watermark", "@someone")
+            self.assertEqual(render.WATERMARK, "@someone")
+            self._app(d)
+            self.assertEqual(render.WATERMARK, "@Kaldockhi")

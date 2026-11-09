@@ -111,6 +111,21 @@
     padding: 6px 14px; border-radius: 999px; cursor: pointer; transition: background .2s, color .2s; }
   .seg button[aria-pressed="true"] { background: rgba(255, 255, 255, .12); color: var(--text); }
   .num { text-align: right; font-variant-numeric: tabular-nums; }
+  .watch-form { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 14px; }
+  .watch-form .search { margin: 0; }
+  .btn { border: 0; font: inherit; font-size: 13px; font-weight: 600; color: #0b0d10; background: #8ec5ff; padding: 8px 16px;
+    border-radius: 10px; cursor: pointer; }
+  .btn.ghost { background: rgba(255, 255, 255, .07); color: var(--text); }
+  .btn:hover { filter: brightness(1.1); }
+  .x { position: absolute; right: 14px; top: 2px; z-index: 2; border: 0; background: rgba(255, 255, 255, .06); color: var(--muted); border-radius: 999px; width: 26px; height: 26px;
+    cursor: pointer; font-size: 14px; line-height: 26px; }
+  .x:hover { background: rgba(255, 69, 58, .25); color: #ff8a80; }
+  .off { opacity: .55; }
+  tr.click { cursor: pointer; } tr.click:hover td { background: rgba(255, 255, 255, .05); }
+  .drawer { position: fixed; inset: 0 0 0 auto; width: min(560px, 100%); background: #0f141a; box-shadow: -20px 0 60px rgba(0,0,0,.5);
+    transform: translateX(100%); transition: transform .3s ease; z-index: 15; overflow-y: auto; padding: 20px; }
+  .drawer.open { transform: none; }
+  .ctl.on-blue { background: rgba(142, 197, 255, .18); color: #8ec5ff; }
   .tight td, .tight th { padding: 6px 8px; }
   footer { color: var(--faint); font-size: 12.5px; padding: 40px 0 30px; }
 </style>
@@ -125,6 +140,7 @@
     </div>
     <div class="status"><span class="dot" id="dot"></span><span id="status-text">Starting…</span></div>
     <div class="controls">
+      <button class="ctl" id="btn-notify" title="Get a desktop notification for new emergencies and watched aircraft">🔔 Alerts</button>
       <button class="ctl" id="btn-pause" title="Stop checking until you press Resume">Pause</button>
       <button class="ctl" id="btn-check" title="Check the feeds right now">Check now</button>
       <button class="ctl danger" id="btn-stop" title="Shut Plane Watch down">Stop</button>
@@ -136,6 +152,16 @@
   <div class="stats" id="stats"></div>
   <div class="pills" id="pills"></div>
   <div id="current"></div>
+  <h2>Watchlist</h2>
+  <div class="panel">
+    <form class="watch-form" id="watch-form">
+      <input class="search" id="watch-input" placeholder="Track an aircraft: hex (AE6808), callsign (RCH123) or registration (N123AB)" aria-label="Aircraft to track" style="width:min(100%,460px)">
+      <button class="btn" type="submit">Track</button>
+      <span class="meta" id="watch-msg">Followed every check; the last 24 h of its track is downloaded when it's found.</span>
+    </form>
+    <div class="grid" id="watch-grid"></div>
+  </div>
+
   <h2>Emergency map</h2>
   <div class="overview"><img id="overview" alt="Map of aircraft in an emergency now and earlier" style="display:none" onload="this.style.display='block'" onerror="this.style.display='none'"></div>
   <div id="cleared"></div>
@@ -173,6 +199,7 @@
   A squawk can be a mis-set code and an ACARS keyword can be a false match, so check the evidence before treating anything as confirmed.</footer>
 
 <div class="lightbox" id="lightbox"><img alt=""></div>
+<aside class="drawer" id="drawer" aria-label="Aircraft details"></aside>
 
 <script>
 const COLORS = {hijack:"#ff2d55", bomb:"#ff2d55", downed:"#ff2d55", security:"#ff6b2d", emergency:"#ff3b30", fire:"#ff6b2d",
@@ -291,6 +318,8 @@ function render() {
       ${a.airframes ? " airframes.io on." : " Set AIRFRAMES_API_KEY to add airframes.io."}</div></div>
     <div class="panel"><div class="k">Warnings</div>${live.errors.length ? `<details class="errors" ${live.alerts.length ? "" : "open"}><summary>${live.errors.length} source warning(s)</summary><ul>${live.errors.map(e => `<li>${esc(e)}</li>`).join("")}</ul></details>` : '<span class="meta">None</span>'}</div>`;
   bindImages();
+  renderWatch();
+  notifyChanges();
 }
 
 function render7700() {
@@ -346,8 +375,9 @@ function renderMilitary() {
   const def = WHERE[whereTab], q = $("where-search").value.toLowerCase();
   const data = (P[whereTab] || []).filter(r => !q || JSON.stringify(r).toLowerCase().includes(q)).slice(0, 400);
   $("where-table").innerHTML = `<thead><tr>${def.head.map((h, i) => `<th class="${def.num.includes(i) ? "num" : ""}">${h}</th>`).join("")}</tr></thead><tbody>`
-    + (data.map(r => `<tr>${def.row(r).map((c, i) => `<td class="${def.num.includes(i) ? "num" : ""}">${c}</td>`).join("")}</tr>`).join("")
+    + (data.map(r => `<tr${r.hex ? ` class="click" data-hex="${esc(r.hex)}" title="Show this aircraft's flights"` : ""}>${def.row(r).map((c, i) => `<td class="${def.num.includes(i) ? "num" : ""}">${c}</td>`).join("")}</tr>`).join("")
        || `<tr><td colspan="${def.head.length}" class="meta">Nothing recorded for this period yet.</td></tr>`) + "</tbody>";
+  document.querySelectorAll("#where-table tr[data-hex]").forEach(tr => tr.onclick = () => lookup(tr.dataset.hex));
   const csv = {flights: "flights", airfields: "airfields", aircraft: "aircraft"}[whereTab];
   $("where-downloads").innerHTML = csv ? `Download: <a href="data/military_${csv}_${period}.csv">military_${csv}_${period}.csv</a>` : "";
 }
@@ -355,6 +385,88 @@ document.querySelectorAll('[data-group="period"] button').forEach(b => b.onclick
 document.querySelectorAll("#where-tabs button").forEach(b => b.onclick = () => { whereTab = b.dataset.t; $("where-search").value = ""; renderMilitary(); });
 $("where-search").oninput = renderMilitary;
 renderMilitary();
+
+async function post(action, body) {
+  const r = await fetch("api/" + action, {method: "POST", headers: {"X-PlaneWatch": "1", "Content-Type": "application/json"}, body: JSON.stringify(body || {})});
+  return r.json().catch(() => ({ok: false, message: "No answer from Plane Watch"}));
+}
+$("watch-form").onsubmit = async e => {
+  e.preventDefault();
+  const q = $("watch-input").value.trim(); if (!q) return;
+  const r = await post("watch", {query: q});
+  $("watch-msg").textContent = r.message || ""; if (r.ok) $("watch-input").value = "";
+  setTimeout(poll, 1500);
+};
+async function unwatch(q) { const r = await post("unwatch", {query: q}); $("watch-msg").textContent = r.message || ""; setTimeout(poll, 800); }
+
+function renderWatch() {
+  const list = (live && live.watchlist) || [];
+  $("watch-grid").innerHTML = list.map(w => `<article class="card ${w.found ? "" : "off"}" style="--c:#5ac8a8">
+      ${w.card ? `<img src="${esc(w.card)}?v=${w.card_v}" alt="Card for ${esc(w.label)}" loading="lazy" data-full="${esc(w.card)}?v=${w.card_v}">` : ""}
+      <div class="body">
+        <button class="x" title="Stop tracking" data-unwatch="${esc(w.query)}">×</button>
+        <div class="top" style="padding-right:36px"><span class="ident">${esc(w.label || w.query)}</span><span class="cat">${w.found ? "TRACKING" : "NOT VISIBLE NOW"}</span></div>
+        <div class="meta">${esc([w.desc || w.type, w.reg, w.hex, w.squawk && "squawk " + w.squawk].filter(Boolean).join(" · "))}</div>
+        <div class="meta">${w.found
+          ? `${w.alt === 0 ? "on the ground" : (w.alt ?? "?").toLocaleString() + " ft"} · ${w.speed != null ? Math.round(w.speed) + " kt" : ""}${w.near ? ` · near <strong>${esc(w.near.icao)}</strong> ${esc(w.near.name)} (${w.near.km} km)` : ""}`
+          : (w.last_seen ? "Last seen " + esc(w.last_seen.replace("T", " ").slice(0, 16)) + " UTC" : "Not seen yet: it shows up when it's broadcasting ADS-B.")}</div>
+        ${w.hex ? `<p><button class="btn ghost" data-lookup="${esc(w.hex)}">Flights &amp; history</button></p>` : ""}
+      </div></article>`).join("") || `<p class="meta">Nothing on the watchlist yet.</p>`;
+  document.querySelectorAll("[data-unwatch]").forEach(b => b.onclick = () => unwatch(b.dataset.unwatch));
+  document.querySelectorAll("[data-lookup]").forEach(b => b.onclick = () => lookup(b.dataset.lookup));
+  bindImages();
+}
+
+async function lookup(hex) {
+  const d = $("drawer"); d.classList.add("open");
+  d.innerHTML = `<button class="x" onclick="document.getElementById('drawer').classList.remove('open')">×</button><p class="meta">Loading ${esc(hex)}…</p>`;
+  let r; try { r = await (await fetch("api/aircraft?hex=" + encodeURIComponent(hex))).json(); } catch { r = {found: false}; }
+  const close = `<button class="x" style="top:16px;right:16px" onclick="document.getElementById('drawer').classList.remove('open')">×</button>`;
+  if (!r.found) { d.innerHTML = close + `<div class="ident" style="font-size:24px;font-weight:700;margin-top:4px">${esc(hex)}</div><p class="meta">Nothing recorded for this aircraft yet.</p>`; return; }
+  const i = r.info;
+  d.innerHTML = close + `<div class="ident" style="font-size:24px;font-weight:700;margin-top:4px">${esc(i.callsign || i.reg || hex)}</div>
+    <div class="meta">${esc([i.descr || i.type, i.reg, hex, i.operator].filter(Boolean).join(" · "))}</div>
+    <div class="stats" style="margin:14px 0">
+      <div class="stat"><div class="n">${r.flights.length}</div><div class="l">flights, 7 days</div></div>
+      <div class="stat"><div class="n">${r.km.toLocaleString()}</div><div class="l">km flown</div></div>
+      <div class="stat"><div class="n">${r.positions.toLocaleString()}</div><div class="l">positions</div></div></div>
+    <p class="meta">Last seen ${fmtT(i.last_seen)} UTC${r.near ? ` near <strong>${esc(r.near.icao)}</strong> ${esc(r.near.name)}` : ""}.
+      Airfields: ${esc(r.airfields.join(", ") || "none identified")}</p>
+    <p>${r.watched ? `<span class="meta">On your watchlist.</span>` : `<button class="btn" id="drawer-watch">Add to watchlist</button>`}</p>
+    <div class="scroll"><table class="tight"><thead><tr><th>Start (UTC)</th><th>From</th><th>To</th><th class="num">Min</th><th class="num">km</th></tr></thead><tbody>
+    ${r.flights.map(f => `<tr><td>${fmtT(f.start_ts)}</td><td>${ap(f.from)}</td><td>${ap(f.to)}</td><td class="num">${f.minutes}</td><td class="num">${f.km.toLocaleString()}</td></tr>`).join("")
+      || `<tr><td colspan="5" class="meta">No complete flights recorded.</td></tr>`}</tbody></table></div>`;
+  const b = $("drawer-watch"); if (b) b.onclick = async () => { const x = await post("watch", {query: "hex:" + hex}); b.outerHTML = `<span class="meta">${esc(x.message)}</span>`; setTimeout(poll, 1500); };
+}
+
+// ---- desktop notifications
+let notifyOn = false; try { notifyOn = localStorage.getItem("pw-notify") === "1" && Notification.permission === "granted"; } catch {}
+let seenAlerts = null, seenWatch = null;
+function paintNotify() { $("btn-notify").classList.toggle("on-blue", notifyOn); $("btn-notify").textContent = notifyOn ? "🔔 Alerts on" : "🔔 Alerts"; }
+$("btn-notify").onclick = async () => {
+  if (!("Notification" in window)) { alert("This browser can't show notifications."); return; }
+  if (!notifyOn) { const p = await Notification.requestPermission(); notifyOn = p === "granted"; } else notifyOn = false;
+  try { localStorage.setItem("pw-notify", notifyOn ? "1" : "0"); } catch {}
+  paintNotify();
+};
+paintNotify();
+function ding() { try { const c = new AudioContext(), o = c.createOscillator(), g = c.createGain(); o.frequency.value = 880; g.gain.setValueAtTime(.12, c.currentTime);
+  g.gain.exponentialRampToValueAtTime(.0001, c.currentTime + .6); o.connect(g).connect(c.destination); o.start(); o.stop(c.currentTime + .6); } catch {} }
+function notifyChanges() {
+  const alerts = live.alerts.filter(a => !a.ground_test), watch = (live.watchlist || []).filter(w => w.found);
+  const ids = new Set(alerts.map(a => a.aircraft.hex + a.category)), wq = new Set(watch.map(w => w.query));
+  if (seenAlerts && notifyOn) {
+    for (const a of alerts) if (!seenAlerts.has(a.aircraft.hex + a.category)) {
+      new Notification(`${a.category_label}: ${a.aircraft.callsign || a.aircraft.hex}`, {body: [a.aircraft.description || a.aircraft.type_code, a.aircraft.squawk && "squawk " + a.aircraft.squawk].filter(Boolean).join(" · "), tag: a.id});
+      ding();
+    }
+    for (const w of watch) if (!seenWatch.has(w.query)) {
+      new Notification(`Watchlist: ${w.label || w.query} is visible`, {body: [w.desc || w.type, w.near && "near " + w.near.icao].filter(Boolean).join(" · "), tag: "watch-" + w.query});
+      ding();
+    }
+  }
+  seenAlerts = ids; seenWatch = wq;
+}
 
 function renderHistory() {
   const q = $("search").value.toLowerCase();

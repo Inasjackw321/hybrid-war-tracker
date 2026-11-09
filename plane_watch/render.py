@@ -28,6 +28,22 @@ from . import basemap, geo  # noqa: E402
 from .classify import CATEGORIES, SQUAWKS  # noqa: E402
 from .models import Alert, Flag  # noqa: E402
 
+
+def _pick_font(names, fallback):
+    from matplotlib import font_manager
+
+    have = {f.name for f in font_manager.fontManager.ttflist}
+    return next((n for n in names if n in have), fallback)
+
+
+# Use the system's own UI font when there is one (Segoe UI on Windows, SF/Helvetica on macOS): cleaner than DejaVu.
+SANS = _pick_font(("Segoe UI", "Inter", "SF Pro Text", "Helvetica Neue", "Helvetica", "Arial", "Liberation Sans", "Carlito"), "DejaVu Sans")
+MONO = _pick_font(("Cascadia Mono", "Consolas", "SF Mono", "Menlo", "Liberation Mono"), "DejaVu Sans Mono")
+matplotlib.rcParams["font.family"] = "sans-serif"
+matplotlib.rcParams["font.sans-serif"] = [SANS, "DejaVu Sans"]
+
+WATERMARK = "@Kaldockhi"  # shown on every graphic; the app sets it from --watermark
+
 W, H = 800, 450
 SCALE = 2
 PT = SCALE * 0.72  # points per design pixel
@@ -193,14 +209,24 @@ class Card:
         bx, by = np.meshgrid(np.linspace(-1, 1, 80), np.linspace(-1, 1, 80))
         self.image(_rgba(accent, np.exp(-(bx ** 2 + by ** 2) * 3) * 0.22), -30, -40, 90, 76, z=2.3)
 
-        self.ov.add_patch(FancyBboxPatch((9, 6), 24, 24, boxstyle="round,pad=0,rounding_size=7", fc="#ffffff", alpha=0.07, ec="none", zorder=5))
-        self.ov.plot([21], [18], marker=plane_marker(45), markersize=fs(12), color=accent, markeredgewidth=0, zorder=6)
-        self.text(42, 22, self.brand, px=7.5, color=C["muted"])
-        self.text(42 + self.measure(self.brand, 7.5) + 7, 24.5, self.title, px=13, weight="bold")
+        self.ov.add_patch(FancyBboxPatch((10, 7), 22, 22, boxstyle="round,pad=0,rounding_size=7", fc="#ffffff", alpha=0.07, ec="none", zorder=5))
+        self.ov.plot([21], [18], marker=plane_marker(45), markersize=fs(11), color=accent, markeredgewidth=0, zorder=6)
+        self.text(41, 23.5, self.title, px=12.5, weight="bold")
+        # watermark: top right, plus a faint one low over the map so a cropped picture still carries it
+        self._right_x = W - 14
+        if WATERMARK:
+            self.text(self._right_x, 22.5, WATERMARK, px=8.6, weight="bold", ha="right", alpha=0.85)
+            self._right_x -= self.measure(WATERMARK, 8.6, "bold") + 14
+            self.text((PANEL_W + W) / 2 + 10, H - FOOTER_H - 9, WATERMARK, px=7, weight="bold", ha="center", alpha=0.28)
         if sample:
-            self.pill(W - 14, 18, "SAMPLE DATA — NOT A REAL EVENT", 7, "#ff6b61", "#ff453a", bg_alpha=0.16, ha="right")
-        self.text(12, H - 8, footer_left, px=6.4, color=C["footer"], alpha=0.9)
-        self.text(W - 12, H - 8, footer_right, px=6.4, color=C["text"], ha="right", alpha=0.9)
+            self.right_pill("SAMPLE DATA — NOT A REAL EVENT", "#ff6b61", "#ff453a", 0.16)
+        self.text(14, H - 8, footer_left, px=6.2, color=C["footer"], alpha=0.85)
+        self.text(W - 14, H - 8, footer_right, px=6.2, color=C["muted"], ha="right")
+
+    def right_pill(self, s, fg, bg, bg_alpha=1.0):
+        """A pill in the header, right-aligned, to the left of the watermark and any earlier pill."""
+        self.pill(self._right_x, 18, s, 6.8, fg, bg, bg_alpha=bg_alpha, ha="right")
+        self._right_x -= self.measure(s, 6.8, "bold") + 20
 
     def save(self, path):
         self.fig.savefig(path, dpi=100, facecolor=C["bg"])
@@ -463,13 +489,13 @@ def _map(card: Card, alert: Alert):
     taken = [(apx, apy)] + [(ex - 30, ey) for ex, ey in extra_px[: len(extras)]]
     shown = 0
     for name, lat, lon, _rank in basemap.cities():
-        if shown >= 16:
+        if shown >= 10:
             break
         lon = near(lon)
         cx, cy = m.to_px(lon, lat)
         if not (0 < cx < mw - 70 and 26 < cy < mh - 34):
             continue
-        if any(abs(cx - tx) < 62 and abs(cy - ty) < 16 for tx, ty in taken):
+        if any(abs(cx - tx) < 78 and abs(cy - ty) < 20 for tx, ty in taken):
             continue
         if any(bx0 - 4 < cx < bx1 + 4 and by0 - 4 < cy < by1 + 10 for bx0, by0, bx1, by1 in blocked):
             continue
@@ -587,8 +613,8 @@ def _signals(card: Card, m: MapFrame, alert: Alert, avoid_px) -> list[tuple]:
     color = CATEGORIES[msg_flag.category]["color"]
     m.text(bx + 10, by + 12, "●", 5, color, z=13, va="center")
     m.text(bx + 18, by + 12, head, 5.7, C["muted"], z=13, fontweight="bold", va="center")
-    mono = dict(family="DejaVu Sans Mono", va="center")
-    char_w = card.measure("M" * 20, 6.3, family="DejaVu Sans Mono") / 20
+    mono = dict(family=MONO, va="center")
+    char_w = card.measure("M" * 20, 6.3, family=MONO) / 20
     for n, ln in enumerate(lines):
         y = by + 27 + n * line_h
         m.text(bx + 10, y, ln, 6.3, "#d3d9df", z=13, **mono)
@@ -662,14 +688,14 @@ def render_card(alert: Alert, path, photo_bytes: bytes | None = None, title: str
     cat = CATEGORIES[alert.top.category]
     card = Card(title, brand)
     _, _, land_src = basemap.land()
-    parts = [f"Track: {sources.get('track', 'live positions')}", f"position: {sources.get('position', alert.aircraft.source or 'ADS-B')}"]
+    parts = [f"ADS-B: {sources.get('position', alert.aircraft.source or 'community feeds')}"]
     if alert.messages:
         parts.append(f"ACARS: {sources.get('acars', alert.messages[0].source)}")
-    parts += [f"map: {land_src}", brand]
+    parts.append(f"Map: {land_src}")
     when = datetime.fromtimestamp(alert.aircraft.seen_ts or 0, timezone.utc).strftime("%d %b %Y · %H:%M UTC")
     card.chrome(cat["color"], " · ".join(parts), when, sample)
     if getattr(alert, "ground_test", False) and not sample:
-        card.pill(W - 14, 18, "ON THE GROUND · PROBABLY A TEST", 7, C["muted"], "#ffffff", bg_alpha=0.08, ha="right")
+        card.right_pill("ON THE GROUND · PROBABLY A TEST", C["muted"], "#ffffff", 0.08)
     _panel(card, alert, photo_bytes)
     _map(card, alert)
     card.save(path)
@@ -709,7 +735,7 @@ def render_overview(alerts: list[Alert], path, title: str = "PLANE ALERT", brand
     when = datetime.fromtimestamp(when_ts, timezone.utc).strftime("%d %b %Y · %H:%M UTC")
     keep = f" (last {keep_hours:g} h)" if keep_hours else ""
     card.chrome(accent, f"{len(active)} emergenc{'y' if len(active) == 1 else 'ies'} now · {len(past)} earlier{keep} · "
-                        f"position: ADS-B community feeds · map: Natural Earth · {brand}", when, sample)
+                        f"ADS-B community feeds · Map: Natural Earth", when, sample)
 
     # ---- list
     if active:
@@ -792,7 +818,37 @@ def _map_item(m: MapFrame, item: dict, live: bool):
 
 # ------------------------------------------------------------------ military heatmap
 
-HEAT_CMAP = LinearSegmentedColormap.from_list("heat", [(0, "#2b0f5e"), (0.3, "#7b2382"), (0.55, "#d6456c"), (0.78, "#fd9a6a"), (1, "#fdf6c3")])
+HEAT_CMAP = LinearSegmentedColormap.from_list("heat", [(0, "#1b1f6b"), (0.25, "#5a2a9c"), (0.5, "#c23b8f"), (0.7, "#ff6a5a"),
+                                                       (0.86, "#ffb36b"), (1, "#fff6d8")])
+
+
+def _rasterize_segments(chunks, X0, X1, Y0, Y1, nx, ny, max_gap_s=900):
+    """Accumulate flight paths (consecutive positions joined by straight lines) into an ny x nx grid."""
+    hist = np.zeros(ny * nx)
+    for arr in chunks:
+        if arr.size == 0:
+            continue
+        lon2, lat2, lon1, lat1, dt = arr.T
+        ok = ~np.isnan(lon1) & (dt <= max_gap_s) & (np.abs(lon2 - lon1) < 20) & (np.abs(lat2 - lat1) < 20)
+        if not ok.any():
+            continue
+        lon1, lat1, lon2, lat2 = lon1[ok], lat1[ok], lon2[ok], lat2[ok]
+
+        def gx(lon):
+            return (np.radians(lon) - X0) / (X1 - X0) * nx
+
+        def gy(lat):
+            return (np.log(np.tan(np.pi / 4 + np.radians(np.clip(lat, -85, 85)) / 2)) - Y0) / (Y1 - Y0) * ny
+
+        x1, y1, x2, y2 = gx(lon1), gy(lat1), gx(lon2), gy(lat2)
+        n = np.clip(np.ceil(np.hypot(x2 - x1, y2 - y1) / 0.6), 1, 400).astype(int)
+        idx = np.repeat(np.arange(len(n)), n)
+        t = (np.arange(n.sum()) - np.repeat(np.cumsum(n) - n, n)) / np.repeat(n, n)
+        sx = (x1[idx] + (x2 - x1)[idx] * t).astype(int)
+        sy = (y1[idx] + (y2 - y1)[idx] * t).astype(int)
+        inside = (sx >= 0) & (sx < nx) & (sy >= 0) & (sy < ny)
+        hist += np.bincount(sy[inside] * nx + sx[inside], minlength=ny * nx)
+    return hist.reshape(ny, nx)
 
 
 def _blur(a, sigma):
@@ -820,13 +876,13 @@ def _side_list(card: Card, y, heading, rows, max_rows=5):
 
 
 def render_heatmap(points, path, summary: dict, period_label: str, title: str = "PLANE ALERT", brand: str = "plane watch",
-                   sample: bool = False):
+                   sample: bool = False, segments=None):
     """Density of military aircraft positions recorded over a period."""
     accent = "#fd7a5c"
     card = Card(title, brand)
     when = datetime.now(timezone.utc).strftime("%d %b %Y · %H:%M UTC")
     card.chrome(accent, f"{summary.get('positions', 0):,} positions · {summary.get('aircraft_seen', 0):,} military aircraft · "
-                        f"{period_label} · recorded by Plane Watch while running · map: Natural Earth · {brand}", when, sample)
+                        f"{period_label} · Map: Natural Earth", when, sample)
     card.pill(15, 54, f"MILITARY ACTIVITY · {period_label.upper()}", 6.3, "#0b0d10", accent)
     card.text(15, 88, f"{summary.get('aircraft_seen', 0):,}", px=20, weight="bold")
     card.text(15, 101, "military aircraft seen", px=6.4, color=C["muted"])
@@ -857,23 +913,49 @@ def render_heatmap(points, path, summary: dict, period_label: str, title: str = 
     m = MapFrame(card, frame_pts, min_span_deg=span, clamp_lat=(-70, 80))
     m.land()
     if len(pts):
-        nx = 420
-        ny = max(60, int(nx * (m.Y1 - m.Y0) / (m.X1 - m.X0)))
-        xs = np.radians(pts[:, 0])
-        ys = np.array([geo.merc_y(v) for v in pts[:, 1]])
-        hist, _, _ = np.histogram2d(ys, xs, bins=[ny, nx], range=[[m.Y0, m.Y1], [m.X0, m.X1]], weights=weights)
-        fine = _blur(hist, 1.3)
-        wide = _blur(hist, 5.0)
-        v = np.log1p(fine * 4)
-        g = np.log1p(wide * 4)
-        v = v / (v.max() or 1)
-        g = g / (g.max() or 1)
-        val = np.maximum(v, g * 0.55)
-        img = HEAT_CMAP(np.clip(val, 0, 1))
-        img[..., 3] = _smooth(val / 0.06) * (0.3 + 0.65 * val)
-        m.ax.imshow(img, extent=(m.X0, m.X1, m.Y0, m.Y1), origin="lower", aspect="auto", interpolation="bilinear", zorder=2)
+        # dim the land a little so the heat stands out
+        m.ax.imshow(_rgba("#000000", np.full((2, 2), 0.25)), extent=(0, 1, 0, 1), transform=m.ax.transAxes, aspect="auto", zorder=1.6)
+        nx = 760
+        ny = max(80, int(nx * (m.Y1 - m.Y0) / (m.X1 - m.X0)))
+        hist = _rasterize_segments(segments, m.X0, m.X1, m.Y0, m.Y1, nx, ny) if segments is not None else np.zeros((ny, nx))
+        if hist.sum() == 0:  # no paths (or old SQLite): fall back to the binned positions
+            xs = np.radians(pts[:, 0])
+            ys = np.array([geo.merc_y(v) for v in pts[:, 1]])
+            hist, _, _ = np.histogram2d(ys, xs, bins=[ny, nx], range=[[m.Y0, m.Y1], [m.X0, m.X1]], weights=weights)
+            hist = _blur(hist, 1.2)
+        ext = (m.X0, m.X1, m.Y0, m.Y1)
+        # soft glow underneath
+        wide = np.log1p(_blur(hist, 7.0) * 3)
+        wide /= wide.max() or 1
+        glow = HEAT_CMAP(np.clip(wide * 0.75, 0, 1))
+        glow[..., 3] = _smooth(wide / 0.05) * wide ** 0.8 * 0.55
+        m.ax.imshow(glow, extent=ext, origin="lower", aspect="auto", interpolation="bilinear", zorder=2)
+        # crisp paths on top
+        fine = np.log1p(_blur(hist, 0.75) * 2)
+        fine /= np.percentile(fine[fine > 0], 99.7) if (fine > 0).any() else 1
+        fine = np.clip(fine, 0, 1) ** 0.85
+        img = HEAT_CMAP(0.25 + 0.75 * fine)
+        img[..., 3] = _smooth(fine / 0.08) * (0.35 + 0.65 * fine)
+        m.ax.imshow(img, extent=ext, origin="lower", aspect="auto", interpolation="bilinear", zorder=2.1)
         m.ax.set_xlim(m.X0, m.X1)
         m.ax.set_ylim(m.Y0, m.Y1)
+        # label the busiest airfields
+        placed = []
+        for a in summary.get("airfields", [])[:6]:
+            ap = geo.airport(a["icao"])
+            if not ap:
+                continue
+            px, py = m.to_px(ap["lon"], ap["lat"])
+            text = f"{a['icao']}  {a['movements']}"
+            w_ = card.measure(text, 5.8, "bold") + 12
+            r = (px + 7, py - 6, px + 7 + w_, py + 7)
+            if not (0 < px < m.vw - w_ - 10 and 20 < py < m.vh - 34) or any(r[0] < q[2] and r[2] > q[0] and r[1] < q[3] and r[3] > q[1] for q in placed):
+                continue
+            placed.append(r)
+            x_, y_ = m.P(ap["lon"], ap["lat"])
+            m.ax.plot([x_], [y_], "o", ms=3 * PT, color="#ffffff", alpha=0.9, mew=0, zorder=8)
+            m.text(px + 9, py, text, 5.8, C["text"], z=8, fontweight="bold", va="center",
+                   bbox=dict(boxstyle="round,pad=0.35,rounding_size=0.6", fc=C["glass"], ec="none", alpha=0.72))
     else:
         m.text(m.vw / 2, m.vh / 2, "No military positions recorded yet. Leave Plane Watch running to build this up.",
                8, C["muted"], z=12, ha="center", va="center")
@@ -889,7 +971,7 @@ def render_heatmap(points, path, summary: dict, period_label: str, title: str = 
     m.ax.set_xlim(m.X0, m.X1)
     m.ax.set_ylim(m.Y0, m.Y1)
     m.text(x0, y - 7, "fewer", 5.3, "#dfe3e8", z=12, ha="left", alpha=0.85, path_effects=HALO)
-    m.text(x1, y - 7, "more positions", 5.3, "#dfe3e8", z=12, ha="right", alpha=0.85, path_effects=HALO)
+    m.text(x1, y - 7, "busier", 5.3, "#dfe3e8", z=12, ha="right", alpha=0.85, path_effects=HALO)
     card.save(path)
     return path
 
@@ -909,7 +991,7 @@ def render_watched(items: list[dict], path, hours: float = 24, title: str = "PLA
     counts = {}
     for i in items:
         counts[i["type"]] = counts.get(i["type"], 0) + 1
-    card.chrome(accent, f"{len(items)} aircraft · last position in the last {hours:g} h · ADS-B community feeds · map: Natural Earth · {brand}",
+    card.chrome(accent, f"{len(items)} aircraft · last positions, {hours:g} h · ADS-B community feeds · Map: Natural Earth",
                 when, sample)
     card.pill(15, 54, f"OSPREY & H-60 · LAST {hours:g} H", 6.3, "#0b0d10", accent)
     x = 15

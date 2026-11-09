@@ -124,6 +124,16 @@ While it runs, Plane Watch records every military aircraft the feeds report (one
 - **A file:** `python planewatch.pyz --acars-file acars.jsonl`
 - **airframes.io:** set the environment variable `AIRFRAMES_API_KEY` before you start the app.
 
+### Tracking
+
+- **Watchlist**: type a hex code (AE6808), callsign (RCH123) or registration (N123AB) into the dashboard's Watchlist box. That aircraft is looked up every check and gets its own live card with its track; the last 24 hours of its track are downloaded when it's first found. Remove it with ×. You can also add aircraft at startup with `--watch AE6808`. Up to 25 aircraft.
+- **Aircraft details**: click any row in the "Where military aircraft go" Flights or Aircraft tables (or "Flights & history" on a watchlist card) to see that aircraft's flights, airfields and distance over the last 7 days, and add it to the watchlist.
+- **Desktop notifications**: press 🔔 Alerts at the top of the dashboard. You get a notification and a short chime when a new emergency appears or a watched aircraft becomes visible. The dashboard tab has to stay open.
+
+### Watermark
+
+Every graphic carries **@Kaldockhi** in the top right, plus a faint copy over the map. Change it with `--watermark "@yourname"`, or turn it off with `--watermark ""`.
+
 ## What it saves
 
 Everything goes in `planewatch-data/` (change it with `--out`):
@@ -152,6 +162,8 @@ Everything goes in `planewatch-data/` (change it with `--out`):
 | `--interval` | 60 | seconds between checks |
 | `--squawks` | 7500,7600,7700 | squawk codes to watch |
 | `--watch-types` | V22,H60 | aircraft types mapped at their last position over 24 h |
+| `--watch AE6808` | | add an aircraft to the watchlist (repeatable) |
+| `--watermark` | @Kaldockhi | text on every graphic |
 | `--backfill-hours` | 24 | history downloaded on start (0 turns it off) |
 | `--record-days` | 8 | how long military positions are kept |
 | `--summary-minutes` | 10 | how often the heatmaps and tables are rebuilt |

@@ -183,11 +183,33 @@ class Store:
             q += " JOIN ac ON ac.hex = p.hex AND ac.military = 1"
         return self.db.execute(q + " WHERE p.ts >= ? GROUP BY 1, 2", (since,)).fetchall()
 
-    def iter_tracks(self, since: float):
+    def segment_chunks(self, since: float, chunk: int = 200_000):
+        """Yield numpy arrays of [lon, lat, prev_lon, prev_lat, seconds_since_prev] for military positions:
+        consecutive points of the same aircraft, so the heatmap can draw paths instead of dots."""
+        import numpy as np
+
+        q = """SELECT p.lon, p.lat, LAG(p.lon) OVER w, LAG(p.lat) OVER w, p.ts - LAG(p.ts) OVER w
+               FROM pos p JOIN ac ON ac.hex = p.hex AND ac.military = 1
+               WHERE p.ts >= ?
+               WINDOW w AS (PARTITION BY p.hex ORDER BY p.ts)"""
+        try:
+            cur = self.db.execute(q, (since,))
+        except sqlite3.OperationalError:  # very old SQLite without window functions: the heatmap uses dots instead
+            return
+        while True:
+            rows = cur.fetchmany(chunk)
+            if not rows:
+                return
+            yield np.array(rows, dtype=float)
+
+    def iter_tracks(self, since: float, hex_code: str | None = None):
         """Yield (hex, [(ts, lat, lon, alt), ...]) one aircraft at a time (streams; doesn't load a week into memory)."""
         from itertools import groupby
 
-        rows = self.db.execute("SELECT hex, ts, lat, lon, alt FROM pos WHERE ts >= ? ORDER BY hex, ts", (since,))
+        if hex_code:
+            rows = self.db.execute("SELECT hex, ts, lat, lon, alt FROM pos WHERE ts >= ? AND hex = ? ORDER BY ts", (since, hex_code))
+        else:
+            rows = self.db.execute("SELECT hex, ts, lat, lon, alt FROM pos WHERE ts >= ? ORDER BY hex, ts", (since,))
         for h, grp in groupby(rows, key=lambda r: r[0]):
             yield h, [r[1:] for r in grp]
 
@@ -263,12 +285,12 @@ def _end(lat, lon, alt) -> dict | None:
     return {"icao": a["icao"], "name": a["name"], "country": a.get("country", ""), "km": round(d, 1)} if a else None
 
 
-def flights(store: Store, since: float, info: dict | None = None) -> list[dict]:
+def flights(store: Store, since: float, info: dict | None = None, hex_code: str | None = None) -> list[dict]:
     info = info or store.aircraft_info()
     out = []
-    for h, pts in store.iter_tracks(since):
+    for h, pts in store.iter_tracks(since, hex_code):
         meta = info.get(h, {})
-        if not meta.get("military"):
+        if not meta.get("military") and not hex_code:
             continue
         for f in split_flights(pts):
             dist = sum(geo.haversine_km(a[1], a[2], b[1], b[2]) for a, b in zip(f, f[1:]))
@@ -371,3 +393,28 @@ def write_csvs(summary: dict, folder: Path, suffix: str):
         w.writerow(["hex", "callsign", "reg", "type", "operator", "flights", "km", "airfields"])
         for r in summary["aircraft"]:
             w.writerow([r["hex"], r["callsign"], r["reg"], r["type"], r["operator"], r["flights"], r["km"], r["airfields"]])
+
+
+def aircraft_report(db_path: Path, hex_code: str, days: float = 7) -> dict:
+    """Everything recorded about one aircraft: details, flights and a thinned track (for the dashboard lookup)."""
+    store = Store(db_path)
+    try:
+        hex_code = hex_code.upper()
+        info = store.aircraft_info()
+        meta = info.get(hex_code)
+        if not meta:
+            return {"hex": hex_code, "found": False}
+        since = time.time() - days * 86400
+        fl = flights(store, since, info, hex_code)
+        pts = next((p for h, p in store.iter_tracks(since, hex_code)), [])
+        step = max(1, len(pts) // 500)
+        near, d = nearest_airfield(meta["last_lat"], meta["last_lon"], 60) if meta.get("last_lat") is not None else (None, 0)
+        return {
+            "hex": hex_code, "found": True, "info": meta, "flights": fl, "positions": len(pts),
+            "track": [[round(p[2], 3), round(p[1], 3), p[3]] for p in pts[::step]],
+            "near": {"icao": near["icao"], "name": near["name"], "km": round(d)} if near else None,
+            "airfields": sorted({f[k]["icao"] for f in fl for k in ("from", "to") if f[k]}),
+            "km": sum(f["km"] for f in fl),
+        }
+    finally:
+        store.db.close()
