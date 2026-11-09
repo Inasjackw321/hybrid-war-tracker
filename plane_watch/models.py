@@ -75,6 +75,7 @@ class Alert:
     route: dict | None = None  # {"origin": {...}, "destination": {...}} if known
     photo: dict | None = None  # {"url", "photographer", "link", "same_type"}
     card: str = ""  # path of the rendered PNG, relative to the output dir
+    ground_test: bool = False  # squawking on the ground without having been airborne: probably a test
 
     @property
     def id(self) -> str:
@@ -105,4 +106,5 @@ class Alert:
             "photo": self.photo,
             "track_points": len(self.aircraft.track),
             "card": self.card,
+            "ground_test": self.ground_test,
         }

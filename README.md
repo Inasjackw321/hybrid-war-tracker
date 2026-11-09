@@ -108,7 +108,9 @@ While it runs, Plane Watch records every military aircraft the feeds report (one
 - **Where they go**: every flight split at landings and long gaps, with the nearest airfield at each end, plus tables of the busiest airfields, types, operators and individual aircraft. They're on the dashboard and saved as CSV.
 - **Ospreys and H-60s**: the last position of every V-22 Osprey and H-60 (Black Hawk / Seahawk family, which includes the MH-60) seen in the last 24 hours, on a map and in a table. Change the types with `--watch-types`.
 
-The heatmap and tables only cover the time Plane Watch has been running, so leave it on to build up a full week.
+**History on start:** each time it starts, it downloads the last 24 hours of track history (from the feeds' trace files) for every military aircraft, Osprey and H-60 it can see. That way the heatmap and tables aren't empty at first. The dashboard shows the download's progress. It only finds aircraft the feeds show at the moment, so anything older than that, or aircraft that have switched off, comes from leaving Plane Watch running.
+
+**Ground tests:** an aircraft squawking an emergency code while parked or taxiing, which wasn't seen flying with it, is listed separately as "on the ground, probably a test". It's left off the emergency map and counters. Airbus and Boeing test aircraft (F-WZ…, N-numbers at Everett) do this a lot.
 
 ![Sample card: ACARS bomb threat with diversion](docs/plane-watch-bomb-threat.png)
 
@@ -150,6 +152,7 @@ Everything goes in `planewatch-data/` (change it with `--out`):
 | `--interval` | 60 | seconds between checks |
 | `--squawks` | 7500,7600,7700 | squawk codes to watch |
 | `--watch-types` | V22,H60 | aircraft types mapped at their last position over 24 h |
+| `--backfill-hours` | 24 | history downloaded on start (0 turns it off) |
 | `--record-days` | 8 | how long military positions are kept |
 | `--summary-minutes` | 10 | how often the heatmaps and tables are rebuilt |
 | `--keep-hours` | 6 | how long an aircraft stays on the emergency map after its emergency ends |

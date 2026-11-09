@@ -146,6 +146,7 @@
   <div class="seg" data-group="period"><button data-p="24h">Last 24 hours</button><button data-p="7d">Last 7 days</button></div>
   <div class="overview"><img id="heat" alt="Heatmap of military aircraft positions" style="display:none" onload="this.style.display='block'" onerror="this.style.display='none'"></div>
   <p class="meta" id="heat-meta">Built from what Plane Watch records while it's running. Leave it on to fill in the week.</p>
+  <p class="meta" id="backfill-meta"></p>
 
   <h2>Ospreys &amp; H-60s · last position in the last 24 hours</h2>
   <div class="overview"><img id="watched" alt="Map of Ospreys and H-60 helicopters" style="display:none" onload="this.style.display='block'" onerror="this.style.display='none'"></div>
@@ -243,7 +244,7 @@ function card(a) {
       <div class="top"><span class="ident">${esc(ac.callsign || ac.registration || ac.hex)}</span><span class="cat">${esc(a.category_label)}</span></div>
       <div class="meta">${esc([ac.description || ac.type_code, ac.registration, ac.hex, ac.squawk && "squawk " + ac.squawk,
         ac.alt_ft != null && (ac.on_ground ? "on ground" : ac.alt_ft.toLocaleString() + " ft")].filter(Boolean).join(" · "))}</div>
-      <div class="meta">${a.live ? "Flagged since " + esc(a.first_seen.slice(11, 16)) + " UTC" : "Cleared · last seen " + esc(a.last_seen.slice(11, 16)) + " UTC"}
+      <div class="meta">${a.ground ? "On the ground since " + esc(a.first_seen.slice(11, 16)) + " UTC" : a.live ? "Flagged since " + esc(a.first_seen.slice(11, 16)) + " UTC" : "Cleared · last seen " + esc(a.last_seen.slice(11, 16)) + " UTC"}
         ${a.divert_airport ? ` · diverting to <strong>${esc(a.divert_airport.icao)}</strong> ${esc(a.divert_airport.name)}` : ""}</div>
       <ul class="ev">${ev.map(f => `<li>${f.origin === "acars" ? `ACARS: ${esc(f.category)}` : esc(f.evidence)}</li>`).join("")}</ul>
       ${msg ? `<div class="acars">${highlight(msg.text, a.flags)}</div>` : ""}
@@ -251,7 +252,7 @@ function card(a) {
 }
 
 function render() {
-  const alerts = live.alerts, counts = {};
+  const alerts = live.alerts.filter(a => !a.ground_test), ground = live.alerts.filter(a => a.ground_test), counts = {};
   alerts.forEach(a => counts[a.category] = (counts[a.category] || 0) + 1);
   $("pills").innerHTML = alerts.length ? `<button class="pill" aria-pressed="${!filter}" data-c="">All ${alerts.length}</button>` +
     Object.entries(counts).map(([c, n]) => `<button class="pill" style="--c:${COLORS[c]}" aria-pressed="${filter === c}" data-c="${c}">${esc(c)} ${n}</button>`).join("") : "";
@@ -262,6 +263,10 @@ function render() {
       .filter(([c]) => c in sq).map(([c, l, col]) => `<div class="stat" style="--c:${sq[c] ? col : "var(--text)"}"><div class="n">${sq[c]}</div><div class="l">${l}</div></div>`).join("")
     + `<div class="stat"><div class="n">${live.military_now ?? 0}</div><div class="l">military aircraft tracked now</div></div>`
     + `<div class="stat" style="--c:#ff9f0a"><div class="n">${live.watched_now ?? 0}</div><div class="l">Ospreys / H-60s airborne now</div></div>`;
+  const bf = live.backfill;
+  $("backfill-meta").innerHTML = !bf || !bf.total ? "" : bf.running
+    ? `<span style="color:var(--warn)">●</span> Downloading the last ${bf.hours} h of history: ${bf.done} / ${bf.total} aircraft, ${bf.points.toLocaleString()} positions so far. The maps and tables update when it's done.`
+    : `Downloaded the last ${bf.hours} h of history for ${bf.total} aircraft (${bf.points.toLocaleString()} positions).`;
   if (live.squawks) $("subtitle").textContent = `Emergency squawks ${live.squawks.join(" · ")}, transponder emergencies, ACARS threats`;
   $("current").innerHTML = live.phase === "stopped"
       ? `<div class="quiet"><strong>Plane Watch is stopped</strong>Start it again with <code>Start Plane Watch</code> or <code>python planewatch.py</code>. The cards and history are kept.</div>`
@@ -273,6 +278,9 @@ function render() {
       ? `<div class="quiet"><strong>The last check failed</strong>${esc(live.message)}<div class="meta">It tries again automatically. The terminal window has the details.</div></div>`
     : alerts.length ? `<h2>Flagged now</h2><div class="grid">${shown.map(card).join("")}</div>`
     : `<div class="quiet"><strong>All quiet</strong>Nothing is squawking an emergency code or flagged in ACARS right now. The page updates by itself.</div>`;
+  if (ground.length && live.phase === "ok") $("current").innerHTML += `<h2>On the ground · probably tests or maintenance</h2>
+    <p class="meta" style="margin-top:-6px">These are squawking an emergency code while parked or taxiing, and weren't seen flying with it. Test aircraft (registrations like F-WZ…) do this a lot. They're left off the emergency map and counters.</p>
+    <div class="grid">${ground.map(a => card({...a, live: false, ground: true})).join("")}</div>`;
   $("cleared").innerHTML = live.cleared.length ? `<h2>Recently cleared</h2><div class="grid">${live.cleared.map(card).join("")}</div>` : "";
   if (live.phase === "ok") $("overview").src = "cards/overview.png?v=" + Math.round(live.updated_ts);
   const a = live.acars;

@@ -166,6 +166,22 @@ class AdsbClient:
                 return pts
         return []
 
+    def history(self, hex_code: str, since: float, start: int = 0) -> list[TrackPoint]:
+        """Every position in the globe trace file newer than `since` (all legs, not just the current flight).
+        `start` rotates which feed is asked first, to spread the load when downloading many aircraft."""
+        h = hex_code.lower()
+        globes = [s for s in self.sources if SOURCES[s].get("globe")]
+        for src in globes[start % len(globes):] + globes[:start % len(globes)] if globes else []:
+            globe = SOURCES[src]["globe"]
+            try:
+                data = http.get_json(f"{globe}/data/traces/{h[-2:]}/trace_full_{h}.json", headers={"Referer": globe + "/"})
+            except http.FetchError:
+                continue
+            pts = [p for p in parse_trace_all(data) if p.ts >= since]
+            if pts:
+                return pts
+        return []
+
     def route(self, callsign: str, lat: float, lon: float) -> dict | None:
         """Planned route (origin/destination) for a callsign, from adsb.lol's route database."""
         if not callsign:
@@ -184,6 +200,17 @@ def _fill(a: Aircraft, b: Aircraft):
             setattr(a, f, getattr(b, f))
     if a.lat is None and b.lat is not None:
         a.lat, a.lon = b.lat, b.lon
+
+
+def parse_trace_all(data: dict) -> list[TrackPoint]:
+    base = float(data.get("timestamp") or 0)
+    out = []
+    for row in data.get("trace") or []:
+        if len(row) < 4 or row[1] is None or row[2] is None:
+            continue
+        alt = row[3]
+        out.append(TrackPoint(base + float(row[0]), float(row[1]), float(row[2]), 0 if alt == "ground" else _int(alt)))
+    return out
 
 
 def parse_trace(data: dict, hours: float = 8.0) -> list[TrackPoint]:

@@ -4,6 +4,7 @@ import csv
 import json
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -285,7 +286,7 @@ class LiveAppTests(unittest.TestCase):
     def _args(self, out, **kw):
         from plane_watch.app import parser
 
-        args = parser().parse_args(["--out", out, "--udp-port", "0", "--no-browser", "--sources", "adsb.lol"])
+        args = parser().parse_args(["--out", out, "--udp-port", "0", "--backfill-hours", "0", "--no-browser", "--sources", "adsb.lol"])
         for k, v in kw.items():
             setattr(args, k, v)
         return args
@@ -416,7 +417,7 @@ class NetworkFailureTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d, \
                 mock.patch.object(adsb.http, "get_json", side_effect=adsb.http.FetchError("x unreachable", network=True)), \
                 mock.patch.object(adsb.time, "sleep"):
-            app = LiveApp(parser().parse_args(["--out", d, "--udp-port", "0", "--no-browser"]))
+            app = LiveApp(parser().parse_args(["--out", d, "--udp-port", "0", "--backfill-hours", "0", "--no-browser"]))
             status = app.cycle()
         self.assertEqual(status["phase"], "offline")
         self.assertIn("feeds", status["message"])
@@ -434,7 +435,7 @@ class ControlTests(unittest.TestCase):
             s.bind(("127.0.0.1", 0))
             port = s.getsockname()[1]
         with tempfile.TemporaryDirectory() as d:
-            app = LiveApp(parser().parse_args(["--out", d, "--udp-port", "0", "--no-browser"]))
+            app = LiveApp(parser().parse_args(["--out", d, "--udp-port", "0", "--backfill-hours", "0", "--no-browser"]))
             env = {k: v for k, v in os.environ.items() if k != "PLANE_WATCH_OFFLINE"}
             with mock.patch.dict(os.environ, env, clear=True):
                 got = start_server(Path(d), port, app)
@@ -543,3 +544,68 @@ class TrackerTests(unittest.TestCase):
                                   Path(d) / "w.png", now=1793936100.0)
             for n in ("h.png", "h0.png", "w.png"):
                 self.assertGreater((Path(d) / n).stat().st_size, 10000)
+
+
+class GroundTestAndPhotoTests(unittest.TestCase):
+    def test_ground_squawk_is_marked_as_probable_test(self):
+        from plane_watch.app import LiveApp, parser
+
+        parked = {"now": READSB["now"], "ac": [{"hex": "388e3b", "flight": "FWZFJ", "r": "F-WZFJ", "t": "A359", "alt_baro": "ground",
+                                                 "gs": 0, "squawk": "7600", "lat": 43.63, "lon": 1.37, "seen_pos": 1}]}
+
+        def fake_get(url, headers=None):
+            if "/sqk/7600" in url:
+                return parked
+            if url.endswith("/mil") or "/sqk/" in url or "/type/" in url:
+                return {"now": READSB["now"], "ac": []}
+            raise adsb.http.FetchError("HTTP 404")
+
+        with tempfile.TemporaryDirectory() as d, \
+                mock.patch.object(adsb.http, "get_json", side_effect=fake_get), \
+                mock.patch.object(adsb.http, "post_json", side_effect=adsb.http.FetchError("x")), \
+                mock.patch.object(adsb.time, "sleep"):
+            app = LiveApp(parser().parse_args(["--out", d, "--udp-port", "0", "--backfill-hours", "0", "--no-browser", "--summary-minutes", "1000"]))
+            status = app.cycle()
+        self.assertTrue(status["alerts"][0]["ground_test"])
+        self.assertEqual(status["squawk_now"]["7600"], 0)  # not counted as an emergency
+        self.assertNotIn("388E3B", app.map_recent)  # and not put on the emergency map
+
+    def test_photo_of_a_different_airframe_is_skipped(self):
+        from plane_watch.sources import photos
+
+        swiss = {"photos": [{"link": "https://www.planespotters.net/photo/1/hb-jcl-swiss-airbus-a220-300",
+                             "thumbnail_large": {"src": "https://t.plnspttrs.net/a.jpg"}, "photographer": "X"}]}
+        right = {"photos": [{"link": "https://www.planespotters.net/photo/2/f-wzfj-airbus-a350-941",
+                             "thumbnail_large": {"src": "https://t.plnspttrs.net/b.jpg"}, "photographer": "Y"}]}
+        with mock.patch.object(photos.http, "get_json", side_effect=[swiss, right]):
+            p = photos.find_photo("388E3B", "F-WZFJ")
+        self.assertEqual(p["url"], "https://t.plnspttrs.net/b.jpg")
+        with mock.patch.object(photos.http, "get_json", side_effect=[swiss, {"photos": []}]):
+            self.assertIsNone(photos.find_photo("388E3B", "F-WZFJ"))
+
+
+class BackfillTests(unittest.TestCase):
+    def test_downloads_last_day_for_seen_aircraft(self):
+        from plane_watch.app import Backfill, LiveApp, parser
+
+        now = time.time()
+        trace = {"timestamp": now - 20 * 3600, "trace": [[i * 300, 34.9 + i * 0.01, -76.9, 0 if i == 0 else 2000, 150, 0, 0]
+                                                         for i in range(200)]}  # 20 h ago until now, every 5 min
+
+        def fake_get(url, headers=None):
+            if "trace_full_ae1111" in url:
+                return trace
+            raise adsb.http.FetchError("HTTP 404")
+
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(adsb.http, "get_json", side_effect=fake_get), \
+                mock.patch("plane_watch.app.time.sleep"):
+            app = LiveApp(parser().parse_args(["--out", d, "--udp-port", "0", "--no-browser"]))
+            bf = Backfill(app, 24)
+            bf.queue.extend([Aircraft("AE1111", "VM1", type_code="V22", military=True), Aircraft("AE2222", type_code="H60")])
+            bf._run()
+            self.assertEqual((bf.done, bf.failed), (2, 1))
+            self.assertGreater(bf.points, 150)
+            w = app.store.watched(now - 86400)
+            self.assertEqual(w[0]["hex"], "AE1111")
+            self.assertGreater(len(w[0]["track"]), 150)
+            self.assertEqual(app._last_summary, 0)  # summaries get rebuilt

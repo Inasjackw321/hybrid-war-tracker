@@ -86,6 +86,69 @@ class AcarsListener:
             return [m for m in self.messages if m.ts >= cutoff]
 
 
+class Backfill:
+    """Downloads the last day's track history for aircraft we can see, in the background.
+
+    The free feeds don't offer "everything from yesterday", but they do publish each aircraft's recent trace
+    file. So the first time the app sees a military aircraft (or an Osprey/H-60), this fetches its trace and
+    stores the positions from the last `hours`. Aircraft that flew earlier but aren't visible now can't be found
+    this way."""
+
+    def __init__(self, app, hours: float):
+        self.app, self.hours = app, hours
+        self.queue: deque = deque()
+        self.queued: set[str] = set()
+        self.done = self.points = self.failed = 0
+        self.lock = threading.Lock()
+        self.thread = None
+        self.finished_at = None
+
+    def add(self, aircraft: list):
+        with self.lock:
+            for ac in aircraft:
+                if ac.hex.startswith("~") or ac.hex in self.queued:
+                    continue
+                self.queued.add(ac.hex)
+                self.queue.append(ac)
+        if self.queue and (self.thread is None or not self.thread.is_alive()):
+            self.finished_at = None
+            self.thread = threading.Thread(target=self._run, daemon=True)
+            self.thread.start()
+
+    def _run(self):
+        store = tracker.Store(self.app.out / "data" / "tracks.sqlite", keep_days=self.app.args.record_days)
+        client = AdsbClient(self.app.client.sources)
+        n = 0
+        while not self.app.stopping.is_set():
+            if self.app.paused.is_set():
+                time.sleep(2)
+                continue
+            with self.lock:
+                if not self.queue:
+                    break
+                ac = self.queue.popleft()
+            since = time.time() - self.hours * 3600
+            try:
+                pts = client.history(ac.hex, since, start=n)
+                self.points += store.add_history(ac, pts, since)
+                if not pts:
+                    self.failed += 1
+            except Exception:  # noqa: BLE001 - one bad trace shouldn't stop the download
+                self.failed += 1
+            self.done += 1
+            n += 1
+            time.sleep(1.0)  # be gentle: requests rotate across the feeds, so each sees one every few seconds
+        store.db.close()
+        self.finished_at = time.time()
+        self.app._last_summary = 0  # rebuild the heatmaps and tables with the new history
+
+    def status(self) -> dict:
+        with self.lock:
+            left = len(self.queue)
+        return {"hours": self.hours, "done": self.done, "total": self.done + left, "points": self.points,
+                "running": bool(self.thread and self.thread.is_alive()), "finished_at": _iso(self.finished_at)}
+
+
 class QuietHandler(SimpleHTTPRequestHandler):
     """Serves the dashboard files, plus a tiny control API for the dashboard buttons."""
 
@@ -175,6 +238,7 @@ class LiveApp:
         self.store = tracker.Store(self.out / "data" / "tracks.sqlite", keep_days=args.record_days)
         self.watch_types = tuple(t.strip().upper() for t in args.watch_types.split(",") if t.strip())
         self._last_summary = 0.0
+        self.backfill = Backfill(self, args.backfill_hours) if args.backfill_hours > 0 else None
         self.squawks = tuple(x.strip() for x in args.squawks.split(",") if x.strip())
         self.paused = threading.Event()
         self.wake = threading.Event()  # set to skip the wait (check now, resume, stop)
@@ -241,6 +305,8 @@ class LiveApp:
         self._military_now = (len(military), len({ac.hex for ac in watched}))
         self.progress(f"Recording {len(military) + len(watched)} military aircraft")
         self.store.record(military + watched + list(aircraft.values()))
+        if self.backfill:  # watched types first, so the Osprey/H-60 map fills in quickly
+            self.backfill.add(watched + military)
 
         # ACARS-only aircraft: look each one up once, not every cycle
         client = _CachedLocator(self.client, self.locate_cache)
@@ -258,6 +324,14 @@ class LiveApp:
                 entry = {"first_seen": now, "photo_bytes": self._photo(alert), "rendered_ts": None, "sig": None}
             entry.update(alert=alert, last_seen=now)
             self.known[alert.aircraft.hex] = entry
+            # On the ground with an emergency code, never seen flying with it: usually a ground test or maintenance
+            # (Airbus/Boeing test aircraft do this a lot). One that just landed after a real emergency is kept.
+            ac = alert.aircraft
+            recent = (ac.seen_ts or now) - 20 * 60
+            if not ac.on_ground or any(p.alt_ft and p.ts >= recent for p in ac.track):
+                entry["was_airborne"] = True
+            alert.ground_test = bool(ac.on_ground and not entry.get("was_airborne")
+                                     and all(f.origin in ("squawk", "adsb-emergency") for f in alert.flags))
             # redraw when the aircraft moved or the evidence changed
             sig = (alert.aircraft.seen_ts, tuple(sorted((f.category, f.origin, f.ts or 0) for f in alert.flags)),
                    (alert.divert_airport or {}).get("icao"))
@@ -317,7 +391,8 @@ class LiveApp:
         }
         status["paused"] = self.paused.is_set()
         status["military_now"], status["watched_now"] = getattr(self, "_military_now", (0, 0))
-        status["squawk_now"] = {sq: sum(1 for a in alerts if a.aircraft.squawk == sq) for sq in self.squawks}
+        status["backfill"] = self.backfill.status() if self.backfill else None
+        status["squawk_now"] = {sq: sum(1 for a in alerts if a.aircraft.squawk == sq and not a.ground_test) for sq in self.squawks}
         self.last_status = status
         self._write("live.json", status)
         if self.client.ok_requests and time.time() - self._last_summary >= self.args.summary_minutes * 60:
@@ -409,15 +484,16 @@ class LiveApp:
         pipeline.route_divert_check(new)
 
     def _photo(self, alert: Alert) -> bytes | None:
-        path = self.out / "photos" / f"{alert.aircraft.hex}.jpg"
+        if not alert.photo:
+            return None
+        # named after the photo itself, so a photo that turned out to be the wrong aircraft is never reused
+        path = self.out / "photos" / f"{alert.aircraft.hex}-{hashlib.sha1(alert.photo['url'].encode()).hexdigest()[:10]}.jpg"
         if path.exists():
             return path.read_bytes()
-        if alert.photo:
-            data = photo_src.download(alert.photo["url"])
-            if data:
-                path.write_bytes(data)
-                return data
-        return None
+        data = photo_src.download(alert.photo["url"])
+        if data:
+            path.write_bytes(data)
+        return data
 
     def _summary(self, entry: dict, live: bool) -> dict:
         d = entry["alert"].to_dict()
@@ -520,7 +596,8 @@ class LiveApp:
             print(f"  {stamp}  {len(alerts)} flagged:")
             for a in alerts:
                 ac = a["aircraft"]
-                print(f"           {a['category_label']:<30} {ac['callsign'] or ac['hex']:<9} {ac['description'] or ac['type_code']}")
+                note = "   (on the ground, probably a test)" if a.get("ground_test") else ""
+                print(f"           {a['category_label']:<30} {ac['callsign'] or ac['hex']:<9} {ac['description'] or ac['type_code']}{note}")
         failed = len(status["errors"])
         if failed:
             print(f"           ({failed} source warning{'s' if failed > 1 else ''}; see the dashboard)")
@@ -562,6 +639,8 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--watch-types", default=",".join(tracker.WATCH_TYPES),
                    help="ICAO aircraft types whose last position is mapped over 24 h (default V22,H60: Ospreys and H-60s)")
     p.add_argument("--record-days", type=float, default=8, help="keep recorded military positions this many days (default 8)")
+    p.add_argument("--backfill-hours", type=float, default=24,
+                   help="on start, download this many hours of track history for the military aircraft it sees (0 = off; default 24)")
     p.add_argument("--summary-minutes", type=float, default=10,
                    help="redo the military heatmaps and tables this often (default 10)")
     p.add_argument("--background", action="store_true", help="keep running in the background with no terminal window")

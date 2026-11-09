@@ -668,6 +668,8 @@ def render_card(alert: Alert, path, photo_bytes: bytes | None = None, title: str
     parts += [f"map: {land_src}", brand]
     when = datetime.fromtimestamp(alert.aircraft.seen_ts or 0, timezone.utc).strftime("%d %b %Y · %H:%M UTC")
     card.chrome(cat["color"], " · ".join(parts), when, sample)
+    if getattr(alert, "ground_test", False) and not sample:
+        card.pill(W - 14, 18, "ON THE GROUND · PROBABLY A TEST", 7, C["muted"], "#ffffff", bg_alpha=0.08, ha="right")
     _panel(card, alert, photo_bytes)
     _map(card, alert)
     card.save(path)

@@ -82,7 +82,7 @@ def nearest_airfield(lat: float, lon: float, radius_km: float = AIRFIELD_RADIUS_
 class Store:
     def __init__(self, path: Path, keep_days: float = 8):
         path.parent.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(str(path), check_same_thread=False)
+        self.db = sqlite3.connect(str(path), check_same_thread=False, timeout=60)
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.executescript("""
             CREATE TABLE IF NOT EXISTS pos (hex TEXT, ts REAL, lat REAL, lon REAL, alt INTEGER, gs REAL, trk REAL);
@@ -130,6 +130,41 @@ class Store:
             """, acs)
         if now - self._last_prune > 3600:
             self.prune(now)
+        return len(rows)
+
+    def add_history(self, ac: Aircraft, points: list, since: float) -> int:
+        """Fill in an aircraft's past positions (from a trace download), thinned like live ones.
+        Points already recorded live in that time span are kept; the trace only fills the gaps."""
+        if not points:
+            return 0
+        have = [r[0] for r in self.db.execute("SELECT ts FROM pos WHERE hex = ? AND ts >= ?", (ac.hex, since))]
+        have_set = sorted(have)
+        rows, last_ts = [], None
+        import bisect
+
+        for p in points:
+            if last_ts is not None and p.ts - last_ts < MIN_GAP_S:
+                continue
+            i = bisect.bisect_left(have_set, p.ts - MIN_GAP_S / 2)
+            if i < len(have_set) and abs(have_set[i] - p.ts) < MIN_GAP_S / 2:
+                continue  # already have a live point here
+            rows.append((ac.hex, p.ts, p.lat, p.lon, p.alt_ft, None, None))
+            last_ts = p.ts
+        first, last = points[0], points[-1]
+        with self.db:
+            self.db.executemany("INSERT INTO pos VALUES (?,?,?,?,?,?,?)", rows)
+            self.db.execute("""
+                INSERT INTO ac VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(hex) DO UPDATE SET
+                    callsign = COALESCE(NULLIF(excluded.callsign, ''), ac.callsign),
+                    reg = COALESCE(NULLIF(excluded.reg, ''), ac.reg),
+                    type = COALESCE(NULLIF(excluded.type, ''), ac.type),
+                    descr = COALESCE(NULLIF(excluded.descr, ''), ac.descr),
+                    operator = COALESCE(NULLIF(excluded.operator, ''), ac.operator),
+                    military = MAX(ac.military, excluded.military),
+                    first_seen = MIN(ac.first_seen, excluded.first_seen)
+            """, (ac.hex, ac.callsign, ac.registration, ac.type_code, ac.description, ac.operator, int(ac.military),
+                  first.ts, last.ts, last.lat, last.lon, last.alt_ft, ac.heading, ac.speed_kt))
         return len(rows)
 
     def prune(self, now: float | None = None):
