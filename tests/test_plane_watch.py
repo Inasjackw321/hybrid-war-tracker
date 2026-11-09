@@ -323,6 +323,11 @@ class LiveAppTests(unittest.TestCase):
             self.assertEqual(live["squawks"], ["7500", "7600", "7700"])  # general emergencies only by default
             with (Path(d) / "data" / "alerts.csv").open() as fh:
                 self.assertEqual(len(list(csv.DictReader(fh))), 1)  # same alert, logged once
+            # the military summary ran too
+            mil = json.loads((Path(d) / "data" / "military.json").read_text())
+            self.assertIn("7d", mil["periods"])
+            self.assertTrue((Path(d) / "cards" / "military-heatmap-7d.png").exists())
+            self.assertTrue((Path(d) / "cards" / "watched-24h.png").exists())
 
             # aircraft stops squawking: moves to "recently cleared"
             state["lat"] = None
@@ -467,3 +472,74 @@ class EmergencyMapTests(unittest.TestCase):
         item = __import__("plane_watch.render", fromlist=["map_item"]).map_item(a)
         self.assertLessEqual(len(item["track"]), 201)
         self.assertEqual(item["track"][-1][:2], [round(a.aircraft.track[-1].lon, 3), round(a.aircraft.track[-1].lat, 3)])
+
+
+class TrackerTests(unittest.TestCase):
+    def _ac(self, hex_, ts, lat, lon, alt, t="C17", mil=True):
+        return Aircraft(hex_, callsign="RCH1", type_code=t, description="BOEING C-17A", lat=lat, lon=lon, alt_ft=alt,
+                        on_ground=alt == 0, military=mil, seen_ts=ts, heading=90)
+
+    def test_record_thins_and_splits_flights_between_airfields(self):
+        from plane_watch import tracker
+
+        dover, ramstein = geo.airport("KDOV"), geo.airport("ETAR")
+        with tempfile.TemporaryDirectory() as d:
+            store = tracker.Store(Path(d) / "t.sqlite")
+            now = 1793936000.0
+            self.assertEqual(store.record([self._ac("AE0001", now, dover["lat"], dover["lon"], 0)], now), 1)
+            self.assertEqual(store.record([self._ac("AE0001", now + 30, dover["lat"], dover["lon"], 0)], now), 0)  # < 2 min later
+            for i in range(1, 21):
+                f = i / 20
+                lat = dover["lat"] + (ramstein["lat"] - dover["lat"]) * f
+                lon = dover["lon"] + (ramstein["lon"] - dover["lon"]) * f
+                store.record([self._ac("AE0001", now + i * 600, lat, lon, 0 if i == 20 else 31000)], now + i * 600)
+            store.record([self._ac("A12345", now, 40, -75, 30000, mil=False)], now)  # civil: ignored by the analysis
+            summ = tracker.summarize(store, now - 3600)
+            self.assertEqual(len(summ["flights"]), 1)
+            f = summ["flights"][0]
+            self.assertEqual((f["from"]["icao"], f["to"]["icao"]), ("KDOV", "ETAR"))
+            self.assertGreater(f["km"], 6000)
+            self.assertEqual(summ["airfields"][0]["movements"], 1)
+            self.assertEqual(summ["aircraft_seen"], 1)
+            self.assertEqual(summ["types"][0]["type"], "C17")
+            pts = store.points(now - 3600)
+            self.assertEqual(sum(c for _, _, c in pts), 21)
+            tracker.write_csvs(summ, Path(d), "24h")
+            with (Path(d) / "military_flights_24h.csv").open() as fh:
+                self.assertEqual(list(csv.DictReader(fh))[0]["to_icao"], "ETAR")
+
+    def test_watched_types_last_position(self):
+        from plane_watch import tracker
+
+        with tempfile.TemporaryDirectory() as d:
+            store = tracker.Store(Path(d) / "t.sqlite")
+            now = 1793936000.0
+            nkt = geo.airport("KNKT")
+            store.record([self._ac("AE1111", now - 3600, nkt["lat"], nkt["lon"], 1500, t="V22")], now)
+            store.record([self._ac("AE1111", now - 1800, nkt["lat"] + 0.1, nkt["lon"], 2000, t="V22")], now)
+            store.record([self._ac("AE2222", now - 3 * 86400, 30, -80, 1000, t="H60")], now)  # older than 24 h
+            w = store.watched(now - 86400)
+            self.assertEqual([i["hex"] for i in w], ["AE1111"])
+            self.assertEqual(w[0]["type_label"], "V-22 Osprey")
+            self.assertEqual(len(w[0]["track"]), 2)
+            self.assertEqual(w[0]["near"]["icao"], "KNKT")
+
+    def test_split_flights(self):
+        from plane_watch.tracker import split_flights
+
+        pts = [(0, 1, 1, 0), (60, 1, 1, 0), (120, 1.1, 1.1, 2000), (180, 1.5, 1.5, 9000), (240, 1.9, 1.9, 0),
+               (300, 1.9, 1.9, 0), (360, 2, 2, 3000), (5000, 3, 3, 8000), (5060, 3.1, 3.1, 8000)]
+        self.assertEqual([[p[0] for p in f] for f in split_flights(pts)], [[60, 120, 180, 240], [300, 360], [5000, 5060]])
+
+    def test_renders(self):
+        from plane_watch import render
+
+        with tempfile.TemporaryDirectory() as d:
+            render.render_heatmap([(10.0, 50.0, 5), (10.1, 50.1, 3)] * 15, Path(d) / "h.png",
+                                  {"positions": 8, "aircraft_seen": 1, "flights": [], "types": [], "airfields": []}, "last 24 hours")
+            render.render_heatmap([], Path(d) / "h0.png", {}, "last 7 days")
+            render.render_watched([{"hex": "AE1111", "type": "V22", "callsign": "VM1", "last_seen": 1793936000.0, "lat": 34.9,
+                                    "lon": -76.9, "heading": 90, "track": [[-77, 34.8, 1000], [-76.9, 34.9, 1500]], "near": None}],
+                                  Path(d) / "w.png", now=1793936100.0)
+            for n in ("h.png", "h0.png", "w.png"):
+                self.assertGreater((Path(d) / n).stat().st_size, 10000)

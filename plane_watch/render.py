@@ -786,3 +786,192 @@ def _map_item(m: MapFrame, item: dict, live: bool):
         m.ax.annotate(f"{item['label']} · cleared {_hhmm(item.get('last_seen'))[:5]}", (x, y), xytext=(7 * PT, 4 * PT),
                       textcoords="offset points", fontsize=fs(5.6), color=C["muted"], zorder=4.5,
                       bbox=dict(boxstyle="round,pad=0.35,rounding_size=0.6", fc=C["glass"], ec="none", alpha=0.55))
+
+
+# ------------------------------------------------------------------ military heatmap
+
+HEAT_CMAP = LinearSegmentedColormap.from_list("heat", [(0, "#2b0f5e"), (0.3, "#7b2382"), (0.55, "#d6456c"), (0.78, "#fd9a6a"), (1, "#fdf6c3")])
+
+
+def _blur(a, sigma):
+    r = max(1, int(sigma * 3))
+    k = np.exp(-0.5 * (np.arange(-r, r + 1) / sigma) ** 2)
+    k /= k.sum()
+    a = np.apply_along_axis(lambda v: np.convolve(v, k, mode="same"), 0, a)
+    return np.apply_along_axis(lambda v: np.convolve(v, k, mode="same"), 1, a)
+
+
+def _side_list(card: Card, y, heading, rows, max_rows=5):
+    """A small titled list in the left panel: rows of (left, right, sub)."""
+    card.text(15, y, heading, px=5.4, color=C["faint"], weight="bold")
+    y += 14
+    for left, right, sub in rows[:max_rows]:
+        card.text(15, y, textwrap.shorten(left, 30, placeholder="…"), px=6.8, weight="bold")
+        card.text(PANEL_W - 12, y, right, px=6.2, color=C["muted"], ha="right", weight="bold")
+        if sub:
+            card.text(15, y + 8.5, textwrap.shorten(sub, 42, placeholder="…"), px=5.4, color=C["faint"])
+        y += 19 if sub else 13
+    if not rows:
+        card.text(15, y, "Nothing yet", px=6, color=C["faint"])
+        y += 13
+    return y + 8
+
+
+def render_heatmap(points, path, summary: dict, period_label: str, title: str = "PLANE ALERT", brand: str = "plane watch",
+                   sample: bool = False):
+    """Density of military aircraft positions recorded over a period."""
+    accent = "#fd7a5c"
+    card = Card(title, brand)
+    when = datetime.now(timezone.utc).strftime("%d %b %Y · %H:%M UTC")
+    card.chrome(accent, f"{summary.get('positions', 0):,} positions · {summary.get('aircraft_seen', 0):,} military aircraft · "
+                        f"{period_label} · recorded by Plane Watch while running · map: Natural Earth · {brand}", when, sample)
+    card.pill(15, 54, f"MILITARY ACTIVITY · {period_label.upper()}", 6.3, "#0b0d10", accent)
+    card.text(15, 88, f"{summary.get('aircraft_seen', 0):,}", px=20, weight="bold")
+    card.text(15, 101, "military aircraft seen", px=6.4, color=C["muted"])
+    card.text(PANEL_W - 12, 88, f"{len(summary.get('flights', [])):,}", px=13, weight="bold", ha="right")
+    card.text(PANEL_W - 12, 101, "flights", px=6.4, color=C["muted"], ha="right")
+    y = _side_list(card, 124, "MOST SEEN TYPES",
+                   [(t["type"], f"{t['aircraft']}", nice_desc(t["descr"])) for t in summary.get("types", []) if t["type"] != "?"])
+    _side_list(card, y, "BUSIEST AIRFIELDS",
+               [(f"{a['icao']}  {a['name']}", f"{a['movements']}", f"{a['departures']} out · {a['arrivals']} in · {a['top_types']}")
+                for a in summary.get("airfields", [])])
+
+    arr = np.array(points, dtype=float)
+    arr = arr.reshape(-1, arr.shape[1] if arr.ndim == 2 else 2)
+    pts = arr[:, :2]
+    weights = arr[:, 2] if arr.shape[1] > 2 else np.ones(len(arr))
+    if len(pts) >= 20:
+        def wpct(v, q):  # weighted percentile, so busy cells count more than one-off positions
+            order = np.argsort(v)
+            cw = np.cumsum(weights[order])
+            return v[order][np.searchsorted(cw, cw[-1] * np.array(q) / 100)]
+
+        lo_lon, hi_lon = wpct(pts[:, 0], [1, 99])
+        lo_lat, hi_lat = wpct(pts[:, 1], [1, 99])
+        frame_pts = [(lo_lon, lo_lat), (hi_lon, hi_lat)]
+        span = 30
+    else:
+        frame_pts, span = ([(-150, -50), (170, 70)] if len(pts) == 0 else [tuple(p) for p in pts]), 320 if len(pts) == 0 else 30
+    m = MapFrame(card, frame_pts, min_span_deg=span, clamp_lat=(-70, 80))
+    m.land()
+    if len(pts):
+        nx = 420
+        ny = max(60, int(nx * (m.Y1 - m.Y0) / (m.X1 - m.X0)))
+        xs = np.radians(pts[:, 0])
+        ys = np.array([geo.merc_y(v) for v in pts[:, 1]])
+        hist, _, _ = np.histogram2d(ys, xs, bins=[ny, nx], range=[[m.Y0, m.Y1], [m.X0, m.X1]], weights=weights)
+        fine = _blur(hist, 1.3)
+        wide = _blur(hist, 5.0)
+        v = np.log1p(fine * 4)
+        g = np.log1p(wide * 4)
+        v = v / (v.max() or 1)
+        g = g / (g.max() or 1)
+        val = np.maximum(v, g * 0.55)
+        img = HEAT_CMAP(np.clip(val, 0, 1))
+        img[..., 3] = _smooth(val / 0.06) * (0.3 + 0.65 * val)
+        m.ax.imshow(img, extent=(m.X0, m.X1, m.Y0, m.Y1), origin="lower", aspect="auto", interpolation="bilinear", zorder=2)
+        m.ax.set_xlim(m.X0, m.X1)
+        m.ax.set_ylim(m.Y0, m.Y1)
+    else:
+        m.text(m.vw / 2, m.vh / 2, "No military positions recorded yet. Leave Plane Watch running to build this up.",
+               8, C["muted"], z=12, ha="center", va="center")
+    # legend
+    w, h = 118, 4.5
+    x1, y = m.vw - 12, m.vh - 13
+    x0 = x1 - w
+    xs_ = np.linspace(0, 1, 256)[None, :] * np.ones((8, 1))
+    leg = HEAT_CMAP(xs_)
+    leg[..., 3] = _smooth(xs_ / 0.06) * _smooth((1 - xs_) / 0.06)
+    (ax0, ay0), (ax1, ay1) = m.axc(x0, y + h / 2), m.axc(x1, y - h / 2)
+    m.ax.imshow(leg, extent=(ax0, ax1, ay0, ay1), transform=m.ax.transAxes, aspect="auto", interpolation="bilinear", zorder=12)
+    m.ax.set_xlim(m.X0, m.X1)
+    m.ax.set_ylim(m.Y0, m.Y1)
+    m.text(x0, y - 7, "fewer", 5.3, "#dfe3e8", z=12, ha="left", alpha=0.85, path_effects=HALO)
+    m.text(x1, y - 7, "more positions", 5.3, "#dfe3e8", z=12, ha="right", alpha=0.85, path_effects=HALO)
+    card.save(path)
+    return path
+
+
+# ------------------------------------------------------------------ watched types (Osprey, H-60)
+
+TYPE_COLORS = {"V22": "#ff9f0a", "H60": "#64d2ff"}
+
+
+def render_watched(items: list[dict], path, hours: float = 24, title: str = "PLANE ALERT", brand: str = "plane watch",
+                   now: float | None = None, sample: bool = False):
+    """Last known position of each watched-type aircraft (V-22, H-60) over the last `hours`."""
+    now = now or datetime.now(timezone.utc).timestamp()
+    accent = "#ff9f0a"
+    card = Card(title, brand)
+    when = datetime.fromtimestamp(now, timezone.utc).strftime("%d %b %Y · %H:%M UTC")
+    counts = {}
+    for i in items:
+        counts[i["type"]] = counts.get(i["type"], 0) + 1
+    card.chrome(accent, f"{len(items)} aircraft · last position in the last {hours:g} h · ADS-B community feeds · map: Natural Earth · {brand}",
+                when, sample)
+    card.pill(15, 54, f"OSPREY & H-60 · LAST {hours:g} H", 6.3, "#0b0d10", accent)
+    x = 15
+    for t, label in (("V22", "Ospreys"), ("H60", "H-60s")):
+        card.text(x, 88, str(counts.get(t, 0)), px=17, weight="bold", color=TYPE_COLORS[t])
+        card.text(x, 100, label, px=6.2, color=C["muted"])
+        x += 80
+    y = 122
+    for i in items[:14]:
+        color = TYPE_COLORS.get(i["type"], C["muted"])
+        fresh = now - (i["last_seen"] or 0) < 15 * 60
+        card.ov.plot([16], [y - 3], "o", ms=4 * PT, color=color, alpha=1 if fresh else 0.5, mew=0, zorder=6)
+        card.text(25, y, i.get("callsign") or i.get("reg") or i["hex"], px=7.2, weight="bold", color=C["text"] if fresh else C["muted"])
+        card.text(PANEL_W - 12, y, _hhmm(i["last_seen"]), px=5.6, color=C["muted"] if fresh else C["faint"], ha="right", weight="bold")
+        near = i.get("near")
+        sub = ("Osprey" if i["type"] == "V22" else "H-60") + (f" · near {near['icao']} {near['name']}" if near else "")
+        card.text(25, y + 8.5, textwrap.shorten(sub, 40, placeholder="…"), px=5.4, color=C["faint"])
+        y += 20
+    if len(items) > 14:
+        card.text(25, y, f"+ {len(items) - 14} more", px=6, color=C["muted"])
+    if not items:
+        card.text(15, 124, f"None seen in the last {hours:g} hours.", px=6.6, color=C["muted"])
+
+    pts = [(i["lon"], i["lat"]) for i in items if i.get("lat") is not None]
+    for i in items:
+        pts += [(p[0], p[1]) for p in i.get("track", [])[::15]]
+    m = MapFrame(card, pts or [(-150, -50), (170, 70)], min_span_deg=10 if pts else 320, clamp_lat=(-70, 80))
+    m.land()
+    # labels: freshest first get the best spots; one that would overlap another is moved or left out
+    placed = []
+    label_at = {}
+    for i in sorted(items, key=lambda i: -(i["last_seen"] or 0)):
+        if i.get("lat") is None:
+            continue
+        px, py = m.to_px(i["lon"], i["lat"])
+        text = f"{i.get('callsign') or i.get('reg') or i['hex']} · {_hhmm(i['last_seen'])[:5]}"
+        w, h = card.measure(text, 5.8) + 10, 12
+        for dx, dy in ((8, -14), (8, 2), (-8 - w, -14), (-8 - w, 2), (8, -28), (8, 16)):
+            r = (px + dx, py + dy, px + dx + w, py + dy + h)
+            if r[0] < 0 or r[2] > m.vw or r[1] < 0 or r[3] > m.vh - 30:
+                continue
+            if not any(r[0] < q[2] and r[2] > q[0] and r[1] < q[3] and r[3] > q[1] for q in placed):
+                placed.append(r)
+                label_at[i["hex"]] = (text, r)
+                break
+    for i in sorted(items, key=lambda i: i["last_seen"] or 0):
+        if i.get("lat") is None:
+            continue
+        color = TYPE_COLORS.get(i["type"], C["muted"])
+        fresh = now - (i["last_seen"] or 0) < 15 * 60
+        tr = i.get("track") or []
+        if len(tr) >= 2:
+            lons = _unwrap([p[0] for p in tr])
+            xy = [m.P(lo, p[1]) for lo, p in zip(lons, tr)]
+            m.ax.plot([p[0] for p in xy], [p[1] for p in xy], color=color, alpha=0.35 if fresh else 0.2, lw=1.0 * PT, zorder=3,
+                      solid_joinstyle="round")
+        x, y_ = m.P(i["lon"], i["lat"])
+        if fresh:
+            m.glow_dot(i["lon"], i["lat"], color, 12, z=5)
+        m.ax.plot([x], [y_], marker=plane_marker(i.get("heading")), ms=(10 if fresh else 8) * PT, color=color,
+                  alpha=1 if fresh else 0.55, mew=0, zorder=6)
+        if i["hex"] in label_at:
+            text, r = label_at[i["hex"]]
+            m.text(r[0] + 5, (r[1] + r[3]) / 2, text, 5.8, C["text"] if fresh else C["muted"], z=7, va="center",
+                   bbox=dict(boxstyle="round,pad=0.35,rounding_size=0.6", fc=C["glass"], ec="none", alpha=0.75 if fresh else 0.5))
+    card.save(path)
+    return path

@@ -98,6 +98,18 @@ It checks for all of these, every cycle:
 - **ACARS threats**: bomb threats, hijacking, security problems and unruly passengers, mayday/pan-pan, fire/smoke, engine or pressure failures, medical emergencies, low fuel, and **diversions**. When a message names the airport (`DIVERTING TO LBSF`), the card draws a line to it.
 - **Off-route aircraft**: a flagged aircraft more than 300 km off its planned route gets a *possible diversion* flag.
 
+The dashboard counts how many aircraft are squawking 7700, 7600 and 7500 right now, and lists every 7700 from the last 24 hours.
+
+### Military activity
+
+While it runs, Plane Watch records every military aircraft the feeds report (one position every 2 minutes, kept for 8 days, in `planewatch-data/data/tracks.sqlite`). From that it builds, every 10 minutes:
+
+- **A heatmap** of military positions over the last 24 hours or 7 days, with the most seen types and busiest airfields.
+- **Where they go**: every flight split at landings and long gaps, with the nearest airfield at each end, plus tables of the busiest airfields, types, operators and individual aircraft. They're on the dashboard and saved as CSV.
+- **Ospreys and H-60s**: the last position of every V-22 Osprey and H-60 (Black Hawk / Seahawk family, which includes the MH-60) seen in the last 24 hours, on a map and in a table. Change the types with `--watch-types`.
+
+The heatmap and tables only cover the time Plane Watch has been running, so leave it on to build up a full week.
+
 ![Sample card: ACARS bomb threat with diversion](docs/plane-watch-bomb-threat.png)
 
 ![Sample card: squawk 7700 with an ACARS medical diversion](docs/plane-watch-7700.png)
@@ -123,6 +135,11 @@ Everything goes in `planewatch-data/` (change it with `--out`):
 | `data/history.json` | every alert seen, with first and last time seen |
 | `data/acars_flagged.jsonl` | every flagged ACARS message |
 | `data/live.json` | the current state, which the dashboard reads |
+| `data/tracks.sqlite` | recorded military positions (last 8 days) |
+| `cards/military-heatmap-24h.png`, `-7d.png` | military heatmaps |
+| `cards/watched-24h.png` | Ospreys and H-60s, last 24 hours |
+| `data/military_flights_24h.csv`, `_7d.csv` | every military flight: start, end, from and to airfield, distance |
+| `data/military_airfields_*.csv`, `military_aircraft_*.csv` | busiest airfields; per-aircraft totals |
 
 ## Options
 
@@ -132,6 +149,9 @@ Everything goes in `planewatch-data/` (change it with `--out`):
 |---|---|---|
 | `--interval` | 60 | seconds between checks |
 | `--squawks` | 7500,7600,7700 | squawk codes to watch |
+| `--watch-types` | V22,H60 | aircraft types mapped at their last position over 24 h |
+| `--record-days` | 8 | how long military positions are kept |
+| `--summary-minutes` | 10 | how often the heatmaps and tables are rebuilt |
 | `--keep-hours` | 6 | how long an aircraft stays on the emergency map after its emergency ends |
 | `--background` | | run with no terminal window (what Start Plane Watch.bat does) |
 | `--stop` | | stop a Plane Watch that's running in the background |
@@ -162,6 +182,7 @@ plane_watch/
   sources/           ADS-B feeds, ACARS (decoders + airframes.io), planespotters photos
   classify.py        squawk / emergency / ACARS keyword rules
   pipeline.py        builds and enriches alerts, writes data files
+  tracker.py         records military aircraft, works out flights, airfields, heatmap points
   render.py          the cards and the overview map
   basemap.py         Natural Earth land + cities (downloads 1:50m, falls back to bundled 1:110m)
 tools/build_app.py   builds dist/planewatch.pyz

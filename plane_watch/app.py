@@ -30,7 +30,7 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from importlib.resources import files
 from pathlib import Path
 
-from . import classify, pipeline, render
+from . import classify, pipeline, render, tracker
 from .models import AcarsMessage, Alert, TrackPoint
 from .sources import acars as acars_src
 from .sources import photos as photo_src
@@ -172,6 +172,9 @@ class LiveApp:
         self.history.pop("_acars_logged", None)
         self.locate_cache: dict[str, object] = {}
         self.map_recent: dict[str, dict] = self._load("map_recent.json", {})
+        self.store = tracker.Store(self.out / "data" / "tracks.sqlite", keep_days=args.record_days)
+        self.watch_types = tuple(t.strip().upper() for t in args.watch_types.split(",") if t.strip())
+        self._last_summary = 0.0
         self.squawks = tuple(x.strip() for x in args.squawks.split(",") if x.strip())
         self.paused = threading.Event()
         self.wake = threading.Event()  # set to skip the wait (check now, resume, stop)
@@ -227,8 +230,17 @@ class LiveApp:
         msgs = self.acars()
         flagged = pipeline.flagged_messages(msgs)
         aircraft = {ac.hex: ac for ac in self.client.squawks(self.squawks)}
-        for ac in self.client.emergencies():
+        military = self.client.query("mil")
+        for ac in self.client.emergencies(military=military):
             aircraft.setdefault(ac.hex, ac)
+        watched = []
+        for t in self.watch_types:  # Ospreys, H-60s, ...: some don't carry the military flag in the feeds
+            for ac in self.client.query("type", t):
+                ac.military = True
+                watched.append(ac)
+        self._military_now = (len(military), len({ac.hex for ac in watched}))
+        self.progress(f"Recording {len(military) + len(watched)} military aircraft")
+        self.store.record(military + watched + list(aircraft.values()))
 
         # ACARS-only aircraft: look each one up once, not every cycle
         client = _CachedLocator(self.client, self.locate_cache)
@@ -304,10 +316,42 @@ class LiveApp:
             "cleared": [self._summary(e, live=False) for e in sorted(cleared, key=lambda e: -e["last_seen"])],
         }
         status["paused"] = self.paused.is_set()
+        status["military_now"], status["watched_now"] = getattr(self, "_military_now", (0, 0))
+        status["squawk_now"] = {sq: sum(1 for a in alerts if a.aircraft.squawk == sq) for sq in self.squawks}
         self.last_status = status
         self._write("live.json", status)
+        if self.client.ok_requests and time.time() - self._last_summary >= self.args.summary_minutes * 60:
+            try:
+                self.military_summary()
+            except Exception as e:  # noqa: BLE001 - the live view matters more than the summaries
+                print(f"  ! military summary failed: {e}", file=sys.stderr)
+            self._last_summary = time.time()
         self.progress("", checking=False)
         return status
+
+    def military_summary(self):
+        """Heatmaps, Osprey/H-60 map and the where-they-go tables (every --summary-minutes)."""
+        now = time.time()
+        out = {"updated_at": _iso(now), "updated_ts": now, "record_days": self.args.record_days,
+               "recording_since": _iso(self.store.db.execute("SELECT MIN(ts) FROM pos").fetchone()[0]), "periods": {}}
+        for key, label, hours in (("24h", "last 24 hours", 24), ("7d", "last 7 days", 24 * 7)):
+            self.progress(f"Working out military flights ({label})")
+            summ = tracker.summarize(self.store, now - hours * 3600)
+            tracker.write_csvs(summ, self.out / "data", key)
+            self.progress(f"Drawing the military heatmap ({label})")
+            render.render_heatmap(self.store.points(now - hours * 3600), self.out / "cards" / f"military-heatmap-{key}.png",
+                                  summ, label, title=self.args.title, brand=self.args.brand)
+            out["periods"][key] = {
+                "label": label, "positions": summ["positions"], "aircraft_seen": summ["aircraft_seen"], "flight_count": len(summ["flights"]),
+                "flights": summ["flights"][:400], "airfields": summ["airfields"][:150], "types": summ["types"][:60],
+                "operators": summ["operators"][:40], "aircraft": summ["aircraft"][:300],
+            }
+        self.progress("Drawing the Osprey / H-60 map")
+        watched = self.store.watched(now - 24 * 3600, self.watch_types)
+        render.render_watched(watched, self.out / "cards" / "watched-24h.png", now=now, title=self.args.title, brand=self.args.brand)
+        out["watched"] = [{k: v for k, v in w.items() if k != "track"} for w in watched]
+        out["watch_types"] = {t: tracker.WATCH_TYPES.get(t, t) for t in self.watch_types}
+        self._write("military.json", out)
 
     def control(self, action: str):
         """Called by the dashboard buttons (and --stop)."""
@@ -515,6 +559,11 @@ def parser() -> argparse.ArgumentParser:
                    help="squawk codes to watch (default 7500,7600,7700; 7400 and 7777 also work)")
     p.add_argument("--keep-hours", type=float, default=6,
                    help="keep aircraft on the emergency map (dimmed) this long after their emergency ends (default 6)")
+    p.add_argument("--watch-types", default=",".join(tracker.WATCH_TYPES),
+                   help="ICAO aircraft types whose last position is mapped over 24 h (default V22,H60: Ospreys and H-60s)")
+    p.add_argument("--record-days", type=float, default=8, help="keep recorded military positions this many days (default 8)")
+    p.add_argument("--summary-minutes", type=float, default=10,
+                   help="redo the military heatmaps and tables this often (default 10)")
     p.add_argument("--background", action="store_true", help="keep running in the background with no terminal window")
     p.add_argument("--stop", action="store_true", help="stop a Plane Watch that's running in the background")
     p.add_argument("--interval", type=float, default=60, help="seconds between checks (default 60)")

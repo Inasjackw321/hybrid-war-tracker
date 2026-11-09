@@ -15,13 +15,15 @@ from ..models import Aircraft, TrackPoint
 SOURCES = {
     "adsb.lol": {
         "api": "https://api.adsb.lol/v2",
-        "paths": {"sqk": "/sqk/{}", "hex": "/hex/{}", "callsign": "/callsign/{}", "reg": "/reg/{}", "mil": "/mil"},
+        "paths": {"sqk": "/sqk/{}", "hex": "/hex/{}", "callsign": "/callsign/{}", "reg": "/reg/{}", "mil": "/mil",
+                  "type": "/type/{}"},
         "globe": "https://globe.adsb.lol",
         "route": "https://api.adsb.lol/api/0/routeset",
     },
     "airplanes.live": {
         "api": "https://api.airplanes.live/v2",
-        "paths": {"sqk": "/sqk/{}", "hex": "/hex/{}", "callsign": "/callsign/{}", "reg": "/reg/{}", "mil": "/mil"},
+        "paths": {"sqk": "/sqk/{}", "hex": "/hex/{}", "callsign": "/callsign/{}", "reg": "/reg/{}", "mil": "/mil",
+                  "type": "/type/{}"},
         "globe": "https://globe.airplanes.live",
     },
     "adsb.fi": {
@@ -110,6 +112,8 @@ class AdsbClient:
         """Ask each source in turn; merge results by hex (first source wins, later ones fill gaps)."""
         merged: dict[str, Aircraft] = {}
         for src in self.sources:
+            if kind not in SOURCES[src]["paths"]:
+                continue  # this feed doesn't offer that kind of query
             try:
                 for ac in self._get(src, kind, arg):
                     if ac.hex not in merged:
@@ -138,9 +142,11 @@ class AdsbClient:
                 out.setdefault(ac.hex, ac)
         return list(out.values())
 
-    def emergencies(self, kinds=("general", "lifeguard", "minfuel", "nordo", "unlawful", "downed")) -> list[Aircraft]:
+    EMERGENCY_KINDS = ("general", "lifeguard", "minfuel", "nordo", "unlawful", "downed")
+
+    def emergencies(self, kinds=EMERGENCY_KINDS, military: list[Aircraft] | None = None) -> list[Aircraft]:
         """Military feed filtered to emergency status. (There's no global 'emergency' endpoint.)"""
-        return [ac for ac in self.query("mil") if ac.emergency in kinds]
+        return [ac for ac in (self.query("mil") if military is None else military) if ac.emergency in kinds]
 
     def trace(self, hex_code: str, hours: float = 8.0) -> list[TrackPoint]:
         """Track history for the aircraft's current flight from the globe trace files."""

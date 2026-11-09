@@ -102,6 +102,16 @@
   .lightbox.open { display: flex; animation: fade .25s ease; }
   .lightbox img { max-width: 100%; max-height: 100%; border-radius: 14px; box-shadow: var(--shadow); }
   @keyframes fade { from { opacity: 0; } to { opacity: 1; } }
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin: 0 0 8px; }
+  .stat { background: var(--glass); border-radius: 16px; padding: 12px 16px; box-shadow: var(--shadow); }
+  .stat .n { font-size: 28px; font-weight: 700; line-height: 1.1; color: var(--c, var(--text)); }
+  .stat .l { color: var(--muted); font-size: 12.5px; }
+  .seg { display: inline-flex; background: rgba(255, 255, 255, .05); border-radius: 999px; padding: 3px; margin: 0 0 12px; gap: 2px; flex-wrap: wrap; }
+  .seg button { border: 0; font: inherit; font-size: 13px; font-weight: 600; color: var(--muted); background: transparent;
+    padding: 6px 14px; border-radius: 999px; cursor: pointer; transition: background .2s, color .2s; }
+  .seg button[aria-pressed="true"] { background: rgba(255, 255, 255, .12); color: var(--text); }
+  .num { text-align: right; font-variant-numeric: tabular-nums; }
+  .tight td, .tight th { padding: 6px 8px; }
   footer { color: var(--faint); font-size: 12.5px; padding: 40px 0 30px; }
 </style>
 </head>
@@ -123,11 +133,32 @@
 </header>
 
 <main class="wrap">
+  <div class="stats" id="stats"></div>
   <div class="pills" id="pills"></div>
   <div id="current"></div>
   <h2>Emergency map</h2>
   <div class="overview"><img id="overview" alt="Map of aircraft in an emergency now and earlier" style="display:none" onload="this.style.display='block'" onerror="this.style.display='none'"></div>
   <div id="cleared"></div>
+  <h2>7700 emergencies · last 24 hours</h2>
+  <div class="panel scroll"><table class="tight"><thead><tr><th>First seen (UTC)</th><th>Last seen</th><th>Aircraft</th><th>Type</th><th>What else</th><th>Divert</th></tr></thead><tbody id="sq7700"></tbody></table></div>
+
+  <h2>Military heatmap</h2>
+  <div class="seg" data-group="period"><button data-p="24h">Last 24 hours</button><button data-p="7d">Last 7 days</button></div>
+  <div class="overview"><img id="heat" alt="Heatmap of military aircraft positions" style="display:none" onload="this.style.display='block'" onerror="this.style.display='none'"></div>
+  <p class="meta" id="heat-meta">Built from what Plane Watch records while it's running. Leave it on to fill in the week.</p>
+
+  <h2>Ospreys &amp; H-60s · last position in the last 24 hours</h2>
+  <div class="overview"><img id="watched" alt="Map of Ospreys and H-60 helicopters" style="display:none" onload="this.style.display='block'" onerror="this.style.display='none'"></div>
+  <div class="panel scroll" style="margin-top:14px"><table class="tight"><thead><tr><th>Aircraft</th><th>Type</th><th>Last seen (UTC)</th><th class="num">Altitude</th><th>Last position</th><th>Near</th></tr></thead><tbody id="watched-rows"></tbody></table></div>
+
+  <h2>Where military aircraft go</h2>
+  <div class="seg" data-group="period"><button data-p="24h">Last 24 hours</button><button data-p="7d">Last 7 days</button></div>
+  <div class="seg" id="where-tabs"><button data-t="flights">Flights</button><button data-t="airfields">Busiest airfields</button><button data-t="types">Types</button><button data-t="aircraft">Aircraft</button><button data-t="operators">Operators</button></div>
+  <div class="panel">
+    <input class="search" id="where-search" placeholder="Filter…" aria-label="Filter table">
+    <span class="meta" id="where-downloads"></span>
+    <div class="scroll"><table class="tight" id="where-table"></table></div>
+  </div>
   <h2>Sources</h2>
   <div class="row" id="sources"></div>
   <h2>History</h2>
@@ -149,6 +180,7 @@ const COLORS = {hijack:"#ff2d55", bomb:"#ff2d55", downed:"#ff2d55", security:"#f
 const $ = id => document.getElementById(id);
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 let live = null, lastTs = 0, filter = null, history = {}, prog = {}, alive = true, stopped = false;
+let mil = null, milTs = 0, period = "24h", whereTab = "flights";
 
 function ago(ts) { const s = Math.round(Date.now() / 1000 - ts); return s < 60 ? `${s}s ago` : `${Math.round(s / 60)} min ago`; }
 
@@ -225,6 +257,11 @@ function render() {
     Object.entries(counts).map(([c, n]) => `<button class="pill" style="--c:${COLORS[c]}" aria-pressed="${filter === c}" data-c="${c}">${esc(c)} ${n}</button>`).join("") : "";
   document.querySelectorAll(".pill").forEach(b => b.onclick = () => { filter = b.dataset.c || null; render(); });
   const shown = filter ? alerts.filter(a => a.category === filter) : alerts;
+  const sq = live.squawk_now || {};
+  $("stats").innerHTML = [["7700", "squawking 7700 now", "#ff3b30"], ["7600", "squawking 7600 now", "#ffd60a"], ["7500", "squawking 7500 now", "#ff2d55"]]
+      .filter(([c]) => c in sq).map(([c, l, col]) => `<div class="stat" style="--c:${sq[c] ? col : "var(--text)"}"><div class="n">${sq[c]}</div><div class="l">${l}</div></div>`).join("")
+    + `<div class="stat"><div class="n">${live.military_now ?? 0}</div><div class="l">military aircraft tracked now</div></div>`
+    + `<div class="stat" style="--c:#ff9f0a"><div class="n">${live.watched_now ?? 0}</div><div class="l">Ospreys / H-60s airborne now</div></div>`;
   if (live.squawks) $("subtitle").textContent = `Emergency squawks ${live.squawks.join(" · ")}, transponder emergencies, ACARS threats`;
   $("current").innerHTML = live.phase === "stopped"
       ? `<div class="quiet"><strong>Plane Watch is stopped</strong>Start it again with <code>Start Plane Watch</code> or <code>python planewatch.py</code>. The cards and history are kept.</div>`
@@ -247,6 +284,69 @@ function render() {
     <div class="panel"><div class="k">Warnings</div>${live.errors.length ? `<details class="errors" ${live.alerts.length ? "" : "open"}><summary>${live.errors.length} source warning(s)</summary><ul>${live.errors.map(e => `<li>${esc(e)}</li>`).join("")}</ul></details>` : '<span class="meta">None</span>'}</div>`;
   bindImages();
 }
+
+function render7700() {
+  const day = Date.now() - 864e5;
+  const byHex = {};  // one row per aircraft, even if its alert changed category along the way
+  for (const h of Object.values(history)) {
+    if (!h || h.squawk !== "7700" || Date.parse(h.last_seen) < day) continue;
+    const r = byHex[h.hex];
+    if (!r) { byHex[h.hex] = {...h, categories: [...(h.categories || [])]}; continue; }
+    if (h.first_seen < r.first_seen) r.first_seen = h.first_seen;
+    if (h.last_seen > r.last_seen) { r.last_seen = h.last_seen; r.label = h.label; r.divert_to = h.divert_to || r.divert_to; }
+    r.categories = [...new Set([...r.categories, ...(h.categories || [])])];
+  }
+  const rows = Object.values(byHex).sort((a, b) => b.last_seen.localeCompare(a.last_seen));
+  $("sq7700").innerHTML = rows.map(h => `<tr><td>${esc(h.first_seen.replace("T", " ").slice(0, 16))}</td><td>${esc(h.last_seen.slice(11, 16))}</td>
+    <td><strong>${esc(h.label)}</strong> <span class="meta">${esc(h.hex)}</span></td><td>${esc(h.type)}</td>
+    <td>${esc((h.categories || []).filter(c => c !== "emergency").join(", "))}</td><td>${esc(h.divert_to)}</td></tr>`).join("")
+    || `<tr><td colspan="6" class="meta">No 7700s seen in the last 24 hours (while Plane Watch was running).</td></tr>`;
+}
+
+const fmtT = ts => ts ? new Date(ts * 1000).toISOString().slice(5, 16).replace("T", " ") : "";
+const ap = a => a ? `<strong>${esc(a.icao)}</strong> <span class="meta">${esc(a.name)}</span>` : `<span class="meta">en route</span>`;
+const WHERE = {
+  flights: {head: ["Start (UTC)", "End", "Aircraft", "Type", "From", "To", "Min", "km", "Max alt"],
+    row: f => [fmtT(f.start_ts), fmtT(f.end_ts).slice(6), `<strong>${esc(f.callsign || f.reg || f.hex)}</strong> <span class="meta">${esc(f.hex)}</span>`,
+      esc(f.type), ap(f.from), ap(f.to), f.minutes, f.km.toLocaleString(), (f.max_alt || 0).toLocaleString()], num: [6, 7, 8]},
+  airfields: {head: ["Airfield", "Country", "Movements", "Departures", "Arrivals", "Aircraft", "Main types"],
+    row: a => [`<strong>${esc(a.icao)}</strong> ${esc(a.name)}`, esc(a.country), a.movements, a.departures, a.arrivals, a.unique_aircraft, esc(a.top_types)], num: [2, 3, 4, 5]},
+  types: {head: ["Type", "Description", "Aircraft seen"], row: t => [`<strong>${esc(t.type)}</strong>`, esc(t.descr), t.aircraft], num: [2]},
+  aircraft: {head: ["Aircraft", "Reg", "Type", "Operator", "Flights", "km", "Airfields"],
+    row: a => [`<strong>${esc(a.callsign || a.hex)}</strong> <span class="meta">${esc(a.hex)}</span>`, esc(a.reg), esc(a.type), esc(a.operator), a.flights, a.km.toLocaleString(), esc(a.airfields)], num: [4, 5]},
+  operators: {head: ["Operator", "Aircraft seen"], row: o => [esc(o.operator), o.aircraft], num: [1]},
+};
+
+function renderMilitary() {
+  document.querySelectorAll('[data-group="period"] button').forEach(b => b.setAttribute("aria-pressed", b.dataset.p === period));
+  document.querySelectorAll("#where-tabs button").forEach(b => b.setAttribute("aria-pressed", b.dataset.t === whereTab));
+  if (!mil) { $("where-table").innerHTML = `<tr><td class="meta">The first summary appears a minute or two after Plane Watch starts.</td></tr>`; return; }
+  const v = Math.round(mil.updated_ts);
+  $("heat").src = `cards/military-heatmap-${period}.png?v=${v}`;
+  $("watched").src = `cards/watched-24h.png?v=${v}`;
+  const P = mil.periods[period] || {};
+  $("heat-meta").textContent = `${(P.positions || 0).toLocaleString()} positions from ${(P.aircraft_seen || 0).toLocaleString()} military aircraft, ${(P.flight_count || 0).toLocaleString()} flights. `
+    + `Recording since ${(mil.recording_since || "").replace("T", " ").slice(0, 16)} UTC; positions are kept ${mil.record_days} days. Updated ${fmtT(mil.updated_ts)} UTC.`;
+  const now = Date.now() / 1000;
+  $("watched-rows").innerHTML = (mil.watched || []).map(w => `<tr style="opacity:${now - w.last_seen < 900 ? 1 : .6}">
+    <td><strong>${esc(w.callsign || w.reg || w.hex)}</strong> <span class="meta">${esc(w.reg || "")} ${esc(w.hex)}</span></td>
+    <td style="color:${w.type === "V22" ? "#ff9f0a" : "#64d2ff"}">${esc(w.type === "V22" ? "V-22 Osprey" : w.type === "H60" ? "H-60" : w.type)}</td>
+    <td>${fmtT(w.last_seen)}</td><td class="num">${w.alt === 0 ? "ground" : (w.alt ?? "").toLocaleString()}</td>
+    <td class="meta">${w.lat != null ? w.lat.toFixed(3) + ", " + w.lon.toFixed(3) : ""}</td>
+    <td>${w.near ? `${esc(w.near.icao)} <span class="meta">${esc(w.near.name)} · ${w.near.km} km</span>` : ""}</td></tr>`).join("")
+    || `<tr><td colspan="6" class="meta">None seen in the last 24 hours.</td></tr>`;
+  const def = WHERE[whereTab], q = $("where-search").value.toLowerCase();
+  const data = (P[whereTab] || []).filter(r => !q || JSON.stringify(r).toLowerCase().includes(q)).slice(0, 400);
+  $("where-table").innerHTML = `<thead><tr>${def.head.map((h, i) => `<th class="${def.num.includes(i) ? "num" : ""}">${h}</th>`).join("")}</tr></thead><tbody>`
+    + (data.map(r => `<tr>${def.row(r).map((c, i) => `<td class="${def.num.includes(i) ? "num" : ""}">${c}</td>`).join("")}</tr>`).join("")
+       || `<tr><td colspan="${def.head.length}" class="meta">Nothing recorded for this period yet.</td></tr>`) + "</tbody>";
+  const csv = {flights: "flights", airfields: "airfields", aircraft: "aircraft"}[whereTab];
+  $("where-downloads").innerHTML = csv ? `Download: <a href="data/military_${csv}_${period}.csv">military_${csv}_${period}.csv</a>` : "";
+}
+document.querySelectorAll('[data-group="period"] button').forEach(b => b.onclick = () => { period = b.dataset.p; renderMilitary(); });
+document.querySelectorAll("#where-tabs button").forEach(b => b.onclick = () => { whereTab = b.dataset.t; $("where-search").value = ""; renderMilitary(); });
+$("where-search").oninput = renderMilitary;
+renderMilitary();
 
 function renderHistory() {
   const q = $("search").value.toLowerCase();
@@ -274,9 +374,13 @@ async function poll() {
     const r = await fetch("data/live.json", {cache: "no-store"});
     if (r.ok) {
       const j = await r.json();
+      try {
+        const mr = await fetch("data/military.json", {cache: "no-store"});
+        if (mr.ok) { const mj = await mr.json(); if (mj.updated_ts !== milTs) { mil = mj; milTs = mj.updated_ts; renderMilitary(); } }
+      } catch {}
       if (j.updated_ts !== lastTs || j.paused !== (live && live.paused) || j.phase !== (live && live.phase)) {
         live = j; lastTs = j.updated_ts; render();
-        try { history = await (await fetch("data/history.json", {cache: "no-store"})).json(); delete history._acars_logged; renderHistory(); } catch {}
+        try { history = await (await fetch("data/history.json", {cache: "no-store"})).json(); delete history._acars_logged; renderHistory(); render7700(); } catch {}
       }
     }
   } catch {}
