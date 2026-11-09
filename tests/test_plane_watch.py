@@ -1,6 +1,7 @@
 """plane_watch tests. Offline: every network call is mocked or disabled."""
 
 import csv
+import math
 import json
 import os
 import tempfile
@@ -689,3 +690,61 @@ class WatchlistTests(unittest.TestCase):
             self.assertEqual(render.WATERMARK, "@someone")
             self._app(d)
             self.assertEqual(render.WATERMARK, "@Kaldockhi")
+
+
+class FilterTests(unittest.TestCase):
+    def _store(self, d):
+        from plane_watch import tracker
+
+        store = tracker.Store(Path(d) / "data" / "tracks.sqlite")
+        now = time.time()
+        dover, ramstein, kadena = geo.airport("KDOV"), geo.airport("ETAR"), geo.airport("RODN")
+        for hex_, t, op, a, b in (("AE0001", "C17", "United States Air Force", dover, ramstein),
+                                  ("AE0002", "K35R", "United States Air Force", ramstein, dover),
+                                  ("AE0003", "P8", "United States Navy", kadena, kadena)):
+            for i in range(11):
+                f = i / 10
+                alt = 0 if i in (0, 10) else 30000
+                store.record([Aircraft(hex_, callsign=hex_, type_code=t, operator=op, military=True, on_ground=alt == 0,
+                                       lat=a["lat"] + (b["lat"] - a["lat"]) * f + (0.5 * math.sin(f * 3) if a is b else 0),
+                                       lon=a["lon"] + (b["lon"] - a["lon"]) * f, alt_ft=alt, seen_ts=now - 7200 + i * 600)], now)
+        return store, now
+
+    def test_filters_by_type_operator_airfield_text(self):
+        from plane_watch import tracker
+
+        with tempfile.TemporaryDirectory() as d:
+            store, now = self._store(d)
+            since = now - 86400
+            self.assertEqual(tracker.summarize(store, since)["aircraft_seen"], 3)
+            only_c17 = tracker.summarize(store, since, tracker.Filter(types=["c17"]))
+            self.assertEqual([f["hex"] for f in only_c17["flights"]], ["AE0001"])
+            navy = tracker.summarize(store, since, tracker.Filter(operators=["navy"]))
+            self.assertEqual(navy["aircraft_seen"], 1)
+            via_dover = tracker.summarize(store, since, tracker.Filter(airfield="KDOV"))
+            self.assertEqual(sorted(f["hex"] for f in via_dover["flights"]), ["AE0001", "AE0002"])
+            self.assertEqual(sum(c for *_, c in store.points(since, filt=tracker.Filter(types=["P8"]))), 11)
+            self.assertEqual(sum(c for *_, c in store.points(since, hexes=via_dover["hexes"])), 22)
+            text = tracker.summarize(store, since, tracker.Filter(text="ae0002"))
+            self.assertEqual(text["aircraft_seen"], 1)
+            cat = store.catalog(since)
+            self.assertEqual({t["type"] for t in cat["types"]}, {"C17", "K35R", "P8"})
+            q = tracker.Filter.from_query({"type": ["C17,K35R"], "operator": ["Air Force"], "airfield": ["kdov"], "q": [""]})
+            self.assertEqual((q.types, q.operators, q.airfield), (("C17", "K35R"), ("Air Force",), "KDOV"))
+
+    def test_api_filtered_views(self):
+        from plane_watch.app import LiveApp, parser
+
+        with tempfile.TemporaryDirectory() as d:
+            store, now = self._store(d)
+            store.db.close()
+            app = LiveApp(parser().parse_args(["--out", d, "--udp-port", "0", "--no-browser", "--backfill-hours", "0"]))
+            from plane_watch import tracker
+
+            data = app.filtered_military("7d", tracker.Filter(types=["C17"]))
+            self.assertEqual(data["aircraft_seen"], 1)
+            self.assertTrue((Path(d) / data["heatmap"]).exists())
+            self.assertIs(app.filtered_military("7d", tracker.Filter(types=["C17"])), data)  # cached
+            lp = app.last_positions(["P8", "C17"], 24)
+            self.assertEqual(sorted(i["type"] for i in lp["items"]), ["C17", "P8"])
+            self.assertTrue((Path(d) / lp["map"]).exists())

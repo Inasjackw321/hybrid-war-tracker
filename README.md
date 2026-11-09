@@ -124,6 +124,17 @@ While it runs, Plane Watch records every military aircraft the feeds report (one
 - **A file:** `python planewatch.pyz --acars-file acars.jsonl`
 - **airframes.io:** set the environment variable `AIRFRAMES_API_KEY` before you start the app.
 
+### Filters
+
+The **Military activity** section has a filter bar:
+- **Period:** 24 h, 3 days or 7 days.
+- **Aircraft type:** C-17, KC-135, P-8, … (the menu lists the types recorded, with counts).
+- **Operator.**
+- **Airfield:** ICAO code or name, to show only aircraft that flew from or to it.
+- **Callsign / registration / hex.**
+
+The heatmap and every "where they go" table redraw for the filter, and the filtered tables download as CSV. The **Aircraft type tracker** maps the last position of any types you choose (type them in, or click the type chips) over 6, 24 or 48 hours; the default is Ospreys and H-60s. History can be filtered by category.
+
 ### Tracking
 
 - **Watchlist**: type a hex code (AE6808), callsign (RCH123) or registration (N123AB) into the dashboard's Watchlist box. That aircraft is looked up every check and gets its own live card with its track; the last 24 hours of its track are downloaded when it's first found. Remove it with ×. You can also add aircraft at startup with `--watch AE6808`. Up to 25 aircraft.

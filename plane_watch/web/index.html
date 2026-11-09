@@ -125,6 +125,18 @@
   .drawer { position: fixed; inset: 0 0 0 auto; width: min(560px, 100%); background: #0f141a; box-shadow: -20px 0 60px rgba(0,0,0,.5);
     transform: translateX(100%); transition: transform .3s ease; z-index: 15; overflow-y: auto; padding: 20px; }
   .drawer.open { transform: none; }
+  .filterbar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin: 0 0 10px; }
+  .filterbar .seg { margin: 0; }
+  .filterbar .search { margin: 0; width: auto; min-width: 140px; flex: 1 1 140px; max-width: 240px; }
+  .sel { font: inherit; font-size: 13.5px; color: var(--text); background: rgba(255, 255, 255, .05); border: 0; border-radius: 10px;
+    padding: 8px 12px; outline: none; max-width: 230px; }
+  .sel option { background: #12171e; }
+  .sub-h { font-size: 13px; text-transform: uppercase; letter-spacing: .1em; color: var(--muted); margin: 24px 0 10px; font-weight: 600; }
+  .secnav { display: flex; gap: 4px; flex-wrap: wrap; padding: 0 16px 10px; margin-top: -10px; }
+  .secnav a { color: var(--muted); font-size: 13px; font-weight: 600; padding: 5px 12px; border-radius: 999px; text-decoration: none; }
+  .secnav a:hover { background: rgba(255, 255, 255, .07); color: var(--text); }
+  h2, .stats { scroll-margin-top: 130px; }
+  .busy { color: var(--warn); }
   .ctl.on-blue { background: rgba(142, 197, 255, .18); color: #8ec5ff; }
   .tight td, .tight th { padding: 6px 8px; }
   footer { color: var(--faint); font-size: 12.5px; padding: 40px 0 30px; }
@@ -146,13 +158,17 @@
       <button class="ctl danger" id="btn-stop" title="Shut Plane Watch down">Stop</button>
     </div>
   </div>
+  <nav class="wrap secnav" aria-label="Sections">
+    <a href="#sec-now">Live</a><a href="#sec-watch">Watchlist</a><a href="#sec-map">Emergency map</a><a href="#sec-7700">7700s</a>
+    <a href="#sec-military">Military</a><a href="#sec-types">Type tracker</a><a href="#sec-history">History</a>
+  </nav>
 </header>
 
 <main class="wrap">
-  <div class="stats" id="stats"></div>
+  <div class="stats" id="sec-now"></div>
   <div class="pills" id="pills"></div>
   <div id="current"></div>
-  <h2>Watchlist</h2>
+  <h2 id="sec-watch">Watchlist</h2>
   <div class="panel">
     <form class="watch-form" id="watch-form">
       <input class="search" id="watch-input" placeholder="Track an aircraft: hex (AE6808), callsign (RCH123) or registration (N123AB)" aria-label="Aircraft to track" style="width:min(100%,460px)">
@@ -162,35 +178,53 @@
     <div class="grid" id="watch-grid"></div>
   </div>
 
-  <h2>Emergency map</h2>
+  <h2 id="sec-map">Emergency map</h2>
   <div class="overview"><img id="overview" alt="Map of aircraft in an emergency now and earlier" style="display:none" onload="this.style.display='block'" onerror="this.style.display='none'"></div>
   <div id="cleared"></div>
-  <h2>7700 emergencies · last 24 hours</h2>
+  <h2 id="sec-7700">7700 emergencies · last 24 hours</h2>
   <div class="panel scroll"><table class="tight"><thead><tr><th>First seen (UTC)</th><th>Last seen</th><th>Aircraft</th><th>Type</th><th>What else</th><th>Divert</th></tr></thead><tbody id="sq7700"></tbody></table></div>
 
-  <h2>Military heatmap</h2>
-  <div class="seg" data-group="period"><button data-p="24h">Last 24 hours</button><button data-p="7d">Last 7 days</button></div>
-  <div class="overview"><img id="heat" alt="Heatmap of military aircraft positions" style="display:none" onload="this.style.display='block'" onerror="this.style.display='none'"></div>
+  <h2 id="sec-military">Military activity</h2>
+  <div class="filterbar">
+    <div class="seg" id="f-period"><button data-p="24h">24 h</button><button data-p="3d">3 days</button><button data-p="7d">7 days</button></div>
+    <select class="sel" id="f-type" aria-label="Aircraft type"><option value="">All aircraft types</option></select>
+    <select class="sel" id="f-operator" aria-label="Operator"><option value="">All operators</option></select>
+    <input class="search" id="f-airfield" placeholder="Airfield (ICAO or name)" aria-label="Airfield">
+    <input class="search" id="f-text" placeholder="Callsign, reg or hex" aria-label="Callsign, registration or hex">
+    <button class="btn ghost" id="f-clear">Clear</button>
+  </div>
+  <p class="meta" id="filter-status"></p>
+  <div class="overview"><img id="heat" alt="Heatmap of military aircraft paths" style="display:none" onload="this.style.display='block'" onerror="this.style.display='none'"></div>
   <p class="meta" id="heat-meta">Built from what Plane Watch records while it's running. Leave it on to fill in the week.</p>
   <p class="meta" id="backfill-meta"></p>
 
-  <h2>Ospreys &amp; H-60s · last position in the last 24 hours</h2>
-  <div class="overview"><img id="watched" alt="Map of Ospreys and H-60 helicopters" style="display:none" onload="this.style.display='block'" onerror="this.style.display='none'"></div>
-  <div class="panel scroll" style="margin-top:14px"><table class="tight"><thead><tr><th>Aircraft</th><th>Type</th><th>Last seen (UTC)</th><th class="num">Altitude</th><th>Last position</th><th>Near</th></tr></thead><tbody id="watched-rows"></tbody></table></div>
-
-  <h2>Where military aircraft go</h2>
-  <div class="seg" data-group="period"><button data-p="24h">Last 24 hours</button><button data-p="7d">Last 7 days</button></div>
+  <div class="sub-h">Where they go</div>
   <div class="seg" id="where-tabs"><button data-t="flights">Flights</button><button data-t="airfields">Busiest airfields</button><button data-t="types">Types</button><button data-t="aircraft">Aircraft</button><button data-t="operators">Operators</button></div>
   <div class="panel">
-    <input class="search" id="where-search" placeholder="Filter…" aria-label="Filter table">
+    <input class="search" id="where-search" placeholder="Search this table…" aria-label="Search table">
     <span class="meta" id="where-downloads"></span>
     <div class="scroll"><table class="tight" id="where-table"></table></div>
   </div>
+
+  <h2 id="sec-types">Aircraft type tracker</h2>
+  <div class="filterbar">
+    <input class="search" id="tt-types" placeholder="Types, e.g. V22,H60,C17" aria-label="Aircraft types" style="min-width:240px">
+    <div class="seg" id="tt-hours"><button data-h="6">6 h</button><button data-h="24">24 h</button><button data-h="48">48 h</button></div>
+    <button class="btn" id="tt-go">Show</button>
+    <span class="meta" id="tt-status"></span>
+  </div>
+  <div class="pills" id="tt-chips"></div>
+  <div class="overview"><img id="watched" alt="Map of the last positions of the chosen aircraft types" style="display:none" onload="this.style.display='block'" onerror="this.style.display='none'"></div>
+  <div class="panel scroll" style="margin-top:14px"><table class="tight"><thead><tr><th>Aircraft</th><th>Type</th><th>Last seen (UTC)</th><th class="num">Altitude</th><th>Last position</th><th>Near</th></tr></thead><tbody id="watched-rows"></tbody></table></div>
+
   <h2>Sources</h2>
   <div class="row" id="sources"></div>
-  <h2>History</h2>
+  <h2 id="sec-history">History</h2>
   <div class="panel">
-    <input class="search" id="search" placeholder="Filter by callsign, type, category…" aria-label="Filter history">
+    <div class="filterbar">
+      <input class="search" id="search" placeholder="Callsign, type, hex…" aria-label="Filter history">
+      <select class="sel" id="h-cat" aria-label="Category"><option value="">All categories</option></select>
+    </div>
     <span class="meta">Download: <a href="data/alerts.csv">alerts.csv</a> · <a href="data/acars_flagged.jsonl">acars_flagged.jsonl</a> · <a href="data/history.json">history.json</a></span>
     <div class="scroll"><table><thead><tr><th>First seen (UTC)</th><th>Last seen</th><th>Aircraft</th><th>Type</th><th>Category</th><th>Squawk</th><th>Divert</th></tr></thead><tbody id="history"></tbody></table></div>
   </div>
@@ -286,7 +320,7 @@ function render() {
   document.querySelectorAll(".pill").forEach(b => b.onclick = () => { filter = b.dataset.c || null; render(); });
   const shown = filter ? alerts.filter(a => a.category === filter) : alerts;
   const sq = live.squawk_now || {};
-  $("stats").innerHTML = [["7700", "squawking 7700 now", "#ff3b30"], ["7600", "squawking 7600 now", "#ffd60a"], ["7500", "squawking 7500 now", "#ff2d55"]]
+  $("sec-now").innerHTML = [["7700", "squawking 7700 now", "#ff3b30"], ["7600", "squawking 7600 now", "#ffd60a"], ["7500", "squawking 7500 now", "#ff2d55"]]
       .filter(([c]) => c in sq).map(([c, l, col]) => `<div class="stat" style="--c:${sq[c] ? col : "var(--text)"}"><div class="n">${sq[c]}</div><div class="l">${l}</div></div>`).join("")
     + `<div class="stat"><div class="n">${live.military_now ?? 0}</div><div class="l">military aircraft tracked now</div></div>`
     + `<div class="stat" style="--c:#ff9f0a"><div class="n">${live.watched_now ?? 0}</div><div class="l">Ospreys / H-60s airborne now</div></div>`;
@@ -354,34 +388,111 @@ const WHERE = {
   operators: {head: ["Operator", "Aircraft seen"], row: o => [esc(o.operator), o.aircraft], num: [1]},
 };
 
+const F = {period: "24h", type: "", operator: "", airfield: "", text: ""};
+let cur = null, curKey = "", milBusy = false, TT = null, ttData = null;
+const filtersOn = () => !!(F.type || F.operator || F.airfield || F.text || F.period === "3d");
+const filterQuery = () => new URLSearchParams(Object.entries({period: F.period, type: F.type, operator: F.operator, airfield: F.airfield, q: F.text})
+  .filter(([, v]) => v)).toString();
+
+function fillSelect(id, rows, label, valKey, textFn) {
+  const el = $(id), keep = el.value;
+  el.innerHTML = `<option value="">${label}</option>` + rows.map(r => `<option value="${esc(r[valKey])}">${esc(textFn(r))}</option>`).join("");
+  el.value = rows.some(r => r[valKey] === keep) ? keep : "";
+}
+
+async function loadMilitary() {
+  if (!mil) { renderMilitary(); return; }
+  if (!filtersOn()) {
+    cur = {...(mil.periods[F.period] || {}), heatmap: `cards/military-heatmap-${F.period}.png`, updated_ts: mil.updated_ts, filter: ""};
+    renderMilitary(); return;
+  }
+  const key = filterQuery() + "|" + mil.updated_ts;
+  if (key === curKey && cur) { renderMilitary(); return; }
+  milBusy = true; renderMilitary();
+  try {
+    const r = await fetch("api/military?" + filterQuery());
+    const j = await r.json();
+    if (r.ok) { cur = j; curKey = key; } else $("filter-status").textContent = "Couldn't filter: " + (j.error || r.status);
+  } catch { $("filter-status").textContent = "Couldn't reach Plane Watch."; }
+  milBusy = false; renderMilitary();
+}
+
 function renderMilitary() {
-  document.querySelectorAll('[data-group="period"] button').forEach(b => b.setAttribute("aria-pressed", b.dataset.p === period));
+  document.querySelectorAll("#f-period button").forEach(b => b.setAttribute("aria-pressed", b.dataset.p === F.period));
   document.querySelectorAll("#where-tabs button").forEach(b => b.setAttribute("aria-pressed", b.dataset.t === whereTab));
   if (!mil) { $("where-table").innerHTML = `<tr><td class="meta">The first summary appears a minute or two after Plane Watch starts.</td></tr>`; return; }
-  const v = Math.round(mil.updated_ts);
-  $("heat").src = `cards/military-heatmap-${period}.png?v=${v}`;
-  $("watched").src = `cards/watched-24h.png?v=${v}`;
-  const P = mil.periods[period] || {};
+  const cat = mil.catalog || {types: [], operators: []};
+  fillSelect("f-type", cat.types, "All aircraft types", "type", t => `${t.type}${t.descr ? " · " + t.descr : ""} (${t.aircraft})`);
+  fillSelect("f-operator", cat.operators, "All operators", "operator", o => `${o.operator} (${o.aircraft})`);
+  $("f-type").value = F.type; $("f-operator").value = F.operator;
+  $("filter-status").innerHTML = milBusy ? `<span class="busy">● Working out the filtered view… (7 days can take a few seconds)</span>`
+    : filtersOn() && cur && cur.filter ? `Showing <strong>${esc(cur.filter)}</strong>, ${esc(cur.label || "")}.` : "";
+  const P = cur || {};
+  if (P.heatmap) $("heat").src = `${P.heatmap}?v=${Math.round(P.updated_ts || 0)}`;
   $("heat-meta").textContent = `${(P.positions || 0).toLocaleString()} positions from ${(P.aircraft_seen || 0).toLocaleString()} military aircraft, ${(P.flight_count || 0).toLocaleString()} flights. `
-    + `Recording since ${(mil.recording_since || "").replace("T", " ").slice(0, 16)} UTC; positions are kept ${mil.record_days} days. Updated ${fmtT(mil.updated_ts)} UTC.`;
-  const now = Date.now() / 1000;
-  $("watched-rows").innerHTML = (mil.watched || []).map(w => `<tr style="opacity:${now - w.last_seen < 900 ? 1 : .6}">
-    <td><strong>${esc(w.callsign || w.reg || w.hex)}</strong> <span class="meta">${esc(w.reg || "")} ${esc(w.hex)}</span></td>
-    <td style="color:${w.type === "V22" ? "#ff9f0a" : "#64d2ff"}">${esc(w.type === "V22" ? "V-22 Osprey" : w.type === "H60" ? "H-60" : w.type)}</td>
-    <td>${fmtT(w.last_seen)}</td><td class="num">${w.alt === 0 ? "ground" : (w.alt ?? "").toLocaleString()}</td>
-    <td class="meta">${w.lat != null ? w.lat.toFixed(3) + ", " + w.lon.toFixed(3) : ""}</td>
-    <td>${w.near ? `${esc(w.near.icao)} <span class="meta">${esc(w.near.name)} · ${w.near.km} km</span>` : ""}</td></tr>`).join("")
-    || `<tr><td colspan="6" class="meta">None seen in the last 24 hours.</td></tr>`;
+    + `Recording since ${(mil.recording_since || "").replace("T", " ").slice(0, 16)} UTC; positions are kept ${mil.record_days} days. Updated ${fmtT(P.updated_ts || mil.updated_ts)} UTC.`;
   const def = WHERE[whereTab], q = $("where-search").value.toLowerCase();
   const data = (P[whereTab] || []).filter(r => !q || JSON.stringify(r).toLowerCase().includes(q)).slice(0, 400);
   $("where-table").innerHTML = `<thead><tr>${def.head.map((h, i) => `<th class="${def.num.includes(i) ? "num" : ""}">${h}</th>`).join("")}</tr></thead><tbody>`
     + (data.map(r => `<tr${r.hex ? ` class="click" data-hex="${esc(r.hex)}" title="Show this aircraft's flights"` : ""}>${def.row(r).map((c, i) => `<td class="${def.num.includes(i) ? "num" : ""}">${c}</td>`).join("")}</tr>`).join("")
-       || `<tr><td colspan="${def.head.length}" class="meta">Nothing recorded for this period yet.</td></tr>`) + "</tbody>";
+       || `<tr><td colspan="${def.head.length}" class="meta">Nothing recorded for this filter and period yet.</td></tr>`) + "</tbody>";
   document.querySelectorAll("#where-table tr[data-hex]").forEach(tr => tr.onclick = () => lookup(tr.dataset.hex));
   const csv = {flights: "flights", airfields: "airfields", aircraft: "aircraft"}[whereTab];
-  $("where-downloads").innerHTML = csv ? `Download: <a href="data/military_${csv}_${period}.csv">military_${csv}_${period}.csv</a>` : "";
+  $("where-downloads").innerHTML = !csv ? "" : filtersOn()
+    ? `Download: <a href="api/military?${filterQuery()}&csv=${csv}">${csv} (filtered, CSV)</a>`
+    : F.period === "3d" ? "" : `Download: <a href="data/military_${csv}_${F.period}.csv">military_${csv}_${F.period}.csv</a>`;
+  renderTypes();
 }
-document.querySelectorAll('[data-group="period"] button').forEach(b => b.onclick = () => { period = b.dataset.p; renderMilitary(); });
+
+// ---- type tracker
+const TYPE_COL = {V22: "#ff9f0a", H60: "#64d2ff"}, PALETTE = ["#30d158", "#ff375f", "#bf5af2", "#ffd60a", "#5ac8fa", "#ff6b2d"];
+function typeColor(t, list) { if (TYPE_COL[t]) return TYPE_COL[t]; const others = list.filter(x => !TYPE_COL[x]); return PALETTE[Math.max(0, others.indexOf(t)) % PALETTE.length]; }
+function ttDefault() { return Object.keys((mil && mil.watch_types) || {V22: 1, H60: 1}); }
+function renderTypes() {
+  if (!TT) TT = {types: ttDefault(), hours: 24};
+  if (document.activeElement !== $("tt-types")) $("tt-types").value = TT.types.join(",");
+  document.querySelectorAll("#tt-hours button").forEach(b => b.setAttribute("aria-pressed", +b.dataset.h === TT.hours));
+  const isDefault = TT.hours === 24 && TT.types.join(",") === ttDefault().join(",");
+  const D = isDefault ? {items: (mil && mil.watched) || [], map: "cards/watched-24h.png", updated_ts: mil && mil.updated_ts} : ttData;
+  const top = ((mil && mil.catalog && mil.catalog.types) || []).slice(0, 12);
+  $("tt-chips").innerHTML = top.map(t => `<button class="pill" style="--c:${TT.types.includes(t.type) ? typeColor(t.type, TT.types) : "#8e98a4"}" aria-pressed="${TT.types.includes(t.type)}" data-tt="${esc(t.type)}" title="${esc(t.descr)}">${esc(t.type)} · ${t.aircraft}</button>`).join("");
+  document.querySelectorAll("[data-tt]").forEach(b => b.onclick = () => {
+    const t = b.dataset.tt; TT.types = TT.types.includes(t) ? TT.types.filter(x => x !== t) : [...TT.types, t];
+    if (!TT.types.length) TT.types = ttDefault();
+    loadTypes();
+  });
+  if (!D) return;
+  if (D.map) $("watched").src = `${D.map}?v=${Math.round(D.updated_ts || 0)}`;
+  const now = Date.now() / 1000;
+  $("watched-rows").innerHTML = (D.items || []).map(w => `<tr class="click" data-hex="${esc(w.hex)}" style="opacity:${now - w.last_seen < 900 ? 1 : .6}">
+    <td><strong>${esc(w.callsign || w.reg || w.hex)}</strong> <span class="meta">${esc(w.reg || "")} ${esc(w.hex)}</span></td>
+    <td style="color:${typeColor(w.type, TT.types)}">${esc(w.type === "V22" ? "V-22 Osprey" : w.type === "H60" ? "H-60" : w.type)} <span class="meta">${esc(w.descr && w.type !== "V22" && w.type !== "H60" ? w.descr : "")}</span></td>
+    <td>${fmtT(w.last_seen)}</td><td class="num">${w.alt === 0 ? "ground" : (w.alt ?? "").toLocaleString()}</td>
+    <td class="meta">${w.lat != null ? w.lat.toFixed(3) + ", " + w.lon.toFixed(3) : ""}</td>
+    <td>${w.near ? `${esc(w.near.icao)} <span class="meta">${esc(w.near.name)} · ${w.near.km} km</span>` : ""}</td></tr>`).join("")
+    || `<tr><td colspan="6" class="meta">None of these types seen in the last ${TT.hours} hours.</td></tr>`;
+  document.querySelectorAll("#watched-rows tr[data-hex]").forEach(tr => tr.onclick = () => lookup(tr.dataset.hex));
+}
+async function loadTypes() {
+  const isDefault = TT.hours === 24 && TT.types.join(",") === ttDefault().join(",");
+  if (isDefault) { ttData = null; renderTypes(); return; }
+  $("tt-status").innerHTML = `<span class="busy">● Loading…</span>`; renderTypes();
+  try { const r = await fetch(`api/lastpos?types=${encodeURIComponent(TT.types.join(","))}&hours=${TT.hours}`); ttData = await r.json(); $("tt-status").textContent = ""; }
+  catch { $("tt-status").textContent = "Couldn't reach Plane Watch."; }
+  renderTypes();
+}
+$("tt-go").onclick = () => { TT.types = $("tt-types").value.split(",").map(t => t.trim().toUpperCase()).filter(Boolean).slice(0, 12); if (!TT.types.length) TT.types = ttDefault(); loadTypes(); };
+$("tt-types").onkeydown = e => { if (e.key === "Enter") $("tt-go").click(); };
+document.querySelectorAll("#tt-hours button").forEach(b => b.onclick = () => { if (!TT) TT = {types: ttDefault(), hours: 24}; TT.hours = +b.dataset.h; loadTypes(); });
+
+let debounce = null;
+const later = fn => { clearTimeout(debounce); debounce = setTimeout(fn, 500); };
+document.querySelectorAll("#f-period button").forEach(b => b.onclick = () => { F.period = b.dataset.p; loadMilitary(); });
+$("f-type").onchange = () => { F.type = $("f-type").value; loadMilitary(); };
+$("f-operator").onchange = () => { F.operator = $("f-operator").value; loadMilitary(); };
+$("f-airfield").oninput = () => later(() => { F.airfield = $("f-airfield").value.trim(); loadMilitary(); });
+$("f-text").oninput = () => later(() => { F.text = $("f-text").value.trim(); loadMilitary(); });
+$("f-clear").onclick = () => { Object.assign(F, {type: "", operator: "", airfield: "", text: ""}); $("f-airfield").value = $("f-text").value = ""; loadMilitary(); };
 document.querySelectorAll("#where-tabs button").forEach(b => b.onclick = () => { whereTab = b.dataset.t; $("where-search").value = ""; renderMilitary(); });
 $("where-search").oninput = renderMilitary;
 renderMilitary();
@@ -469,8 +580,14 @@ function notifyChanges() {
 }
 
 function renderHistory() {
-  const q = $("search").value.toLowerCase();
-  const rows = Object.values(history).filter(h => h && h.first_seen).sort((x, y) => y.last_seen.localeCompare(x.last_seen))
+  const q = $("search").value.toLowerCase(), cat = $("h-cat").value;
+  const all = Object.values(history).filter(h => h && h.first_seen);
+  const cats = [...new Set(all.flatMap(h => h.categories || [h.category]))].sort();
+  const sel = $("h-cat"); const keep = sel.value;
+  sel.innerHTML = `<option value="">All categories</option>` + cats.map(c => `<option value="${esc(c)}">${esc(c)}</option>`).join("");
+  sel.value = cats.includes(keep) ? keep : "";
+  const rows = all.sort((x, y) => y.last_seen.localeCompare(x.last_seen))
+    .filter(h => !cat || (h.categories || [h.category]).includes(cat))
     .filter(h => !q || JSON.stringify(h).toLowerCase().includes(q)).slice(0, 300);
   $("history").innerHTML = rows.map(h => `<tr><td>${esc(h.first_seen.replace("T", " ").slice(0, 16))}</td><td>${esc(h.last_seen.slice(11, 16))}</td>
     <td><strong>${esc(h.label)}</strong> <span class="meta">${esc(h.hex)}</span></td><td>${esc(h.type)}</td>
@@ -485,6 +602,7 @@ function bindImages() {
 }
 $("lightbox").onclick = () => $("lightbox").classList.remove("open");
 $("search").oninput = renderHistory;
+$("h-cat").onchange = renderHistory;
 
 async function poll() {
   try { const r = await fetch("api/ping", {cache: "no-store"}); alive = r.ok; if (r.ok) stopped = false; } catch { alive = false; }
@@ -496,7 +614,7 @@ async function poll() {
       const j = await r.json();
       try {
         const mr = await fetch("data/military.json", {cache: "no-store"});
-        if (mr.ok) { const mj = await mr.json(); if (mj.updated_ts !== milTs) { mil = mj; milTs = mj.updated_ts; renderMilitary(); } }
+        if (mr.ok) { const mj = await mr.json(); if (mj.updated_ts !== milTs) { mil = mj; milTs = mj.updated_ts; loadMilitary(); } }
       } catch {}
       if (j.updated_ts !== lastTs || j.paused !== (live && live.paused) || j.phase !== (live && live.phase)) {
         live = j; lastTs = j.updated_ts; render();

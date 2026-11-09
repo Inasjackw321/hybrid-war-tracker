@@ -189,7 +189,7 @@ class Card:
         return self.text(x, y, s, px=px, color=fg, weight=weight, ha=ha, va="center",
                          bbox=dict(boxstyle="round,pad=0.42,rounding_size=0.75", fc=bg, ec="none", alpha=bg_alpha))
 
-    def chrome(self, accent: str, footer_left: str, footer_right: str, sample: bool = False):
+    def chrome(self, accent: str, footer_left: str, footer_right: str, sample: bool = False, subtitle: str = ""):
         ys = np.linspace(0, 1, 120)[:, None]
         xs = np.linspace(0, 1, 160)[None, :]
         # panel: solid, then a long soft fade into the map
@@ -212,6 +212,10 @@ class Card:
         self.ov.add_patch(FancyBboxPatch((10, 7), 22, 22, boxstyle="round,pad=0,rounding_size=7", fc="#ffffff", alpha=0.07, ec="none", zorder=5))
         self.ov.plot([21], [18], marker=plane_marker(45), markersize=fs(11), color=accent, markeredgewidth=0, zorder=6)
         self.text(41, 23.5, self.title, px=12.5, weight="bold")
+        if subtitle:  # a thin rule, then what this picture is about
+            x = 41 + self.measure(self.title, 12.5, "bold") + 10
+            self.ov.plot([x, x], [12, 26], color="#ffffff", alpha=0.14, lw=0.8, zorder=6)
+            self.text(x + 10, 22.5, subtitle, px=7.2, color=C["muted"], weight="bold")
         # watermark: top right, plus a faint one low over the map so a cropped picture still carries it
         self._right_x = W - 14
         if WATERMARK:
@@ -303,6 +307,14 @@ class MapFrame:
         self.ax.add_collection(PolyCollection(polys(outers), facecolors=C["land"], edgecolors=C["coast"], linewidths=lw, zorder=1))
         if holes:
             self.ax.add_collection(PolyCollection(polys(holes), facecolors=C["ocean"], edgecolors=C["coast"], linewidths=lw, zorder=1))
+        # faint graticule, like an aviation chart
+        span = self.lon_hi - self.lon_lo
+        step = 30 if span > 120 else 10 if span > 40 else 5 if span > 15 else 2 if span > 6 else 1
+        for lon in range(int(math.floor(self.lon_lo / step) * step), int(self.lon_hi) + step, step):
+            self.ax.plot([math.radians(lon)] * 2, [self.Y0, self.Y1], color="#ffffff", alpha=0.035, lw=0.45 * PT, zorder=1.2)
+        for lat in range(int(math.floor(max(-80, self.lat_lo) / step) * step), int(min(84, self.lat_hi)) + step, step):
+            y = geo.merc_y(lat)
+            self.ax.plot([self.X0, self.X1], [y, y], color="#ffffff", alpha=0.035, lw=0.45 * PT, zorder=1.2)
         # vignette: darken towards the edges, slightly lift the middle
         xs, ys = np.meshgrid(np.linspace(-1, 1, 200), np.linspace(-1, 1, 120))
         d = np.sqrt((xs * 0.9) ** 2 + (ys * 1.05) ** 2)
@@ -411,11 +423,12 @@ def _panel(card: Card, alert: Alert, photo_bytes: bytes | None):
         ("TRACK START", _hhmm(ac.track[0].ts) if ac.track else "—", None),
         ("SEEN", _hhmm(ac.seen_ts), None),
     ]
-    y = 286
+    card.text(x0, 280, "FLIGHT DATA", px=5.2, color=C["faint"], weight="bold")
+    y = 294
     for label, value, color in rows:
         card.text(x0, y, label, px=5.5, color=C["muted"])
         card.text(xr, y, value, px=7.6, weight="bold", ha="right", color=color or C["text"])
-        y += 18
+        y += 17
 
 
 # ------------------------------------------------------------------ map
@@ -478,9 +491,12 @@ def _map(card: Card, alert: Alert):
         blocked.append((ex - w, ey - 2, ex + 4, ey + h) if side == "right" else (ex - 4, ey - 2, ex + w, ey + h))
         extra_labels.append((text, side))
 
-    title = textwrap.shorten(nice_desc(ac.description or ac.type_code or ac.label), 30, placeholder="…")
-    sub = "" if alert.top.category == "watch" else _badge_text(alert)
-    lw_ = max(card.measure(title, 7.6, "bold"), card.measure(sub, 6, "bold") if sub else 0) + 18
+    title = ac.label
+    bits = [ac.type_code or textwrap.shorten(nice_desc(ac.description or ""), 18, placeholder="…"),
+            "GROUND" if ac.on_ground else (f"{ac.alt_ft:,} ft" if ac.alt_ft is not None else ""),
+            f"{ac.speed_kt:.0f} kt" if ac.speed_kt is not None else ""]
+    sub = "  ·  ".join(b for b in bits if b)
+    lw_ = max(card.measure(title, 7.8, "bold") + 12, card.measure(sub, 6, "bold") if sub else 0) + 18
     lh_ = 32 if sub else 20
     lrect = _place_label(lw_, lh_, apx, apy, mw, mh, track_px + extra_px * 3, blocked)
     blocked.append(lrect)
@@ -538,6 +554,21 @@ def _map(card: Card, alert: Alert):
         ax.add_collection(LineCollection(segs, colors=[(c[0], c[1], c[2], f) for c, f in zip(base, age)],
                                          linewidths=1.9 * PT, capstyle="butt", zorder=8))
         ax.plot([xy[0][0]], [xy[0][1]], "o", ms=3.4 * PT, color=base[0], alpha=0.45, mew=0, zorder=8)
+        # time marks: the start, then every full hour (if there's room), so the track reads like a timeline
+        marks, last_px = [], None
+        for k, p in enumerate(track):
+            hour_change = k and int(p.ts // 3600) != int(track[k - 1].ts // 3600)
+            if k == 0 or hour_change:
+                tx, ty = m.to_px(lons[k], lats[k])
+                if last_px is None or math.hypot(tx - last_px[0], ty - last_px[1]) > 46:
+                    if math.hypot(tx - apx, ty - apy) > 40 and 10 < tx < mw - 40 and 26 < ty < mh - 34:
+                        marks.append((k, tx, ty))
+                        last_px = (tx, ty)
+        for k, tx, ty in marks:
+            p = track[k]
+            stamp = datetime.fromtimestamp(p.ts if k == 0 else (p.ts // 3600) * 3600, timezone.utc).strftime("%H:%M")
+            ax.plot([xy[k][0]], [xy[k][1]], "o", ms=2.6 * PT, color="#ffffff", alpha=0.7, mew=0, zorder=8.5)
+            m.text(tx + 5, ty - 5, stamp, 5.2, C["muted"], z=8.5, alpha=0.9, path_effects=HALO)
 
     # aircraft: soft halo, shadow, icon
     px, py = P(*pos)
@@ -553,9 +584,10 @@ def _map(card: Card, alert: Alert):
         a0, a1 = m.axc(apx, apy), m.axc(cxl, cyl)
         ax.plot([a0[0], a1[0]], [a0[1], a1[1]], transform=ax.transAxes, color="#ffffff", alpha=0.22, lw=0.8 * PT, zorder=10.5)
     m.glass(lx0, ly0, lx1 - lx0, ly1 - ly0, alpha=0.84, z=11)
-    m.text(lx0 + 9, ly0 + 11, title, 7.6, C["text"], z=11.5, fontweight="bold", va="center")
+    m.text(lx0 + 9, ly0 + 11, "●", 5.5, cat["color"], z=11.5, va="center")
+    m.text(lx0 + 19, ly0 + 11, title, 7.8, C["text"], z=11.5, fontweight="bold", va="center")
     if sub:
-        m.text(lx0 + 9, ly0 + 23, sub, 6, cat["color"], z=11.5, fontweight="bold", va="center")
+        m.text(lx0 + 9, ly0 + 23, sub, 6, C["muted"], z=11.5, fontweight="bold", va="center")
 
     _scale_bar(m)
     _alt_legend(m)
@@ -693,7 +725,7 @@ def render_card(alert: Alert, path, photo_bytes: bytes | None = None, title: str
         parts.append(f"ACARS: {sources.get('acars', alert.messages[0].source)}")
     parts.append(f"Map: {land_src}")
     when = datetime.fromtimestamp(alert.aircraft.seen_ts or 0, timezone.utc).strftime("%d %b %Y · %H:%M UTC")
-    card.chrome(cat["color"], " · ".join(parts), when, sample)
+    card.chrome(cat["color"], " · ".join(parts), when, sample, subtitle=f"{cat['label']} · {_hhmm(alert.aircraft.seen_ts)}")
     if getattr(alert, "ground_test", False) and not sample:
         card.right_pill("ON THE GROUND · PROBABLY A TEST", C["muted"], "#ffffff", 0.08)
     _panel(card, alert, photo_bytes)
@@ -735,7 +767,7 @@ def render_overview(alerts: list[Alert], path, title: str = "PLANE ALERT", brand
     when = datetime.fromtimestamp(when_ts, timezone.utc).strftime("%d %b %Y · %H:%M UTC")
     keep = f" (last {keep_hours:g} h)" if keep_hours else ""
     card.chrome(accent, f"{len(active)} emergenc{'y' if len(active) == 1 else 'ies'} now · {len(past)} earlier{keep} · "
-                        f"ADS-B community feeds · Map: Natural Earth", when, sample)
+                        f"ADS-B community feeds · Map: Natural Earth", when, sample, subtitle="Emergency map")
 
     # ---- list
     if active:
@@ -876,13 +908,14 @@ def _side_list(card: Card, y, heading, rows, max_rows=5):
 
 
 def render_heatmap(points, path, summary: dict, period_label: str, title: str = "PLANE ALERT", brand: str = "plane watch",
-                   sample: bool = False, segments=None):
+                   sample: bool = False, segments=None, filter_label: str = ""):
     """Density of military aircraft positions recorded over a period."""
     accent = "#fd7a5c"
     card = Card(title, brand)
     when = datetime.now(timezone.utc).strftime("%d %b %Y · %H:%M UTC")
     card.chrome(accent, f"{summary.get('positions', 0):,} positions · {summary.get('aircraft_seen', 0):,} military aircraft · "
-                        f"{period_label} · Map: Natural Earth", when, sample)
+                        f"{period_label} · Map: Natural Earth", when, sample,
+                subtitle="Military heatmap" + (f" · {filter_label}" if filter_label else ""))
     card.pill(15, 54, f"MILITARY ACTIVITY · {period_label.upper()}", 6.3, "#0b0d10", accent)
     card.text(15, 88, f"{summary.get('aircraft_seen', 0):,}", px=20, weight="bold")
     card.text(15, 101, "military aircraft seen", px=6.4, color=C["muted"])
@@ -979,35 +1012,48 @@ def render_heatmap(points, path, summary: dict, period_label: str, title: str = 
 # ------------------------------------------------------------------ watched types (Osprey, H-60)
 
 TYPE_COLORS = {"V22": "#ff9f0a", "H60": "#64d2ff"}
+TYPE_PALETTE = ["#ff9f0a", "#64d2ff", "#30d158", "#ff375f", "#bf5af2", "#ffd60a", "#5ac8fa", "#ff6b2d"]
+
+
+def type_colors(types) -> dict:
+    out, free = {}, [c for c in TYPE_PALETTE if c not in TYPE_COLORS.values()]
+    for t in types:
+        out[t] = TYPE_COLORS.get(t) or free[len([x for x in out if x not in TYPE_COLORS]) % len(free)]
+    return out
 
 
 def render_watched(items: list[dict], path, hours: float = 24, title: str = "PLANE ALERT", brand: str = "plane watch",
-                   now: float | None = None, sample: bool = False):
-    """Last known position of each watched-type aircraft (V-22, H-60) over the last `hours`."""
+                   now: float | None = None, sample: bool = False, types: list[str] | None = None):
+    """Last known position of each aircraft of the given types (default V-22 and H-60) over the last `hours`."""
     now = now or datetime.now(timezone.utc).timestamp()
-    accent = "#ff9f0a"
+    types = list(types or ["V22", "H60"])
+    colors = type_colors(types + sorted({i["type"] for i in items} - set(types)))
+    accent = colors[types[0]]
     card = Card(title, brand)
     when = datetime.fromtimestamp(now, timezone.utc).strftime("%d %b %Y · %H:%M UTC")
     counts = {}
     for i in items:
         counts[i["type"]] = counts.get(i["type"], 0) + 1
+    names = {"V22": "Ospreys", "H60": "H-60s"}
+    heading = "OSPREY & H-60" if sorted(types) == ["H60", "V22"] else " · ".join(types[:4]) + (" …" if len(types) > 4 else "")
     card.chrome(accent, f"{len(items)} aircraft · last positions, {hours:g} h · ADS-B community feeds · Map: Natural Earth",
-                when, sample)
-    card.pill(15, 54, f"OSPREY & H-60 · LAST {hours:g} H", 6.3, "#0b0d10", accent)
+                when, sample, subtitle=f"Type tracker · last {hours:g} h")
+    card.pill(15, 54, f"{heading} · LAST {hours:g} H", 6.3, "#0b0d10", accent)
     x = 15
-    for t, label in (("V22", "Ospreys"), ("H60", "H-60s")):
-        card.text(x, 88, str(counts.get(t, 0)), px=17, weight="bold", color=TYPE_COLORS[t])
-        card.text(x, 100, label, px=6.2, color=C["muted"])
-        x += 80
+    for t in types[:3]:
+        card.text(x, 88, str(counts.get(t, 0)), px=17, weight="bold", color=colors[t])
+        card.text(x, 100, names.get(t, t), px=6.2, color=C["muted"])
+        x += 62
     y = 122
     for i in items[:14]:
-        color = TYPE_COLORS.get(i["type"], C["muted"])
+        color = colors.get(i["type"], C["muted"])
         fresh = now - (i["last_seen"] or 0) < 15 * 60
         card.ov.plot([16], [y - 3], "o", ms=4 * PT, color=color, alpha=1 if fresh else 0.5, mew=0, zorder=6)
         card.text(25, y, i.get("callsign") or i.get("reg") or i["hex"], px=7.2, weight="bold", color=C["text"] if fresh else C["muted"])
         card.text(PANEL_W - 12, y, _hhmm(i["last_seen"]), px=5.6, color=C["muted"] if fresh else C["faint"], ha="right", weight="bold")
         near = i.get("near")
-        sub = ("Osprey" if i["type"] == "V22" else "H-60") + (f" · near {near['icao']} {near['name']}" if near else "")
+        kind = {"V22": "Osprey", "H60": "H-60"}.get(i["type"], i["type"])
+        sub = kind + (f" · near {near['icao']} {near['name']}" if near else "")
         card.text(25, y + 8.5, textwrap.shorten(sub, 40, placeholder="…"), px=5.4, color=C["faint"])
         y += 20
     if len(items) > 14:
@@ -1040,7 +1086,7 @@ def render_watched(items: list[dict], path, hours: float = 24, title: str = "PLA
     for i in sorted(items, key=lambda i: i["last_seen"] or 0):
         if i.get("lat") is None:
             continue
-        color = TYPE_COLORS.get(i["type"], C["muted"])
+        color = colors.get(i["type"], C["muted"])
         fresh = now - (i["last_seen"] or 0) < 15 * 60
         tr = i.get("track") or []
         if len(tr) >= 2:
@@ -1059,3 +1105,24 @@ def render_watched(items: list[dict], path, hours: float = 24, title: str = "PLA
                    bbox=dict(boxstyle="round,pad=0.35,rounding_size=0.6", fc=C["glass"], ec="none", alpha=0.75 if fresh else 0.5))
     card.save(path)
     return path
+
+
+# matplotlib's pyplot isn't thread-safe; the dashboard can ask for a filtered picture while the main loop draws
+import functools  # noqa: E402
+import threading  # noqa: E402
+
+RENDER_LOCK = threading.RLock()
+
+
+def _locked(fn):
+    @functools.wraps(fn)
+    def wrapper(*a, **kw):
+        with RENDER_LOCK:
+            return fn(*a, **kw)
+    return wrapper
+
+
+render_card = _locked(render_card)
+render_overview = _locked(render_overview)
+render_heatmap = _locked(render_heatmap)
+render_watched = _locked(render_watched)

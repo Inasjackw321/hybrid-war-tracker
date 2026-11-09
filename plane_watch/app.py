@@ -172,6 +172,28 @@ class QuietHandler(SimpleHTTPRequestHandler):
     def do_GET(self):
         if self.path.startswith("/api/ping"):
             return self._json(200, {"app": "planewatch", "pid": os.getpid(), "paused": bool(self.app and self.app.paused.is_set())})
+        if self.path.startswith("/api/military") and self.app is not None:
+            from urllib.parse import parse_qs, urlsplit
+
+            q = parse_qs(urlsplit(self.path).query)
+            try:
+                data = self.app.filtered_military((q.get("period") or ["24h"])[0], tracker.Filter.from_query(q))
+            except Exception as e:  # noqa: BLE001
+                return self._json(500, {"error": str(e)})
+            table = (q.get("csv") or [""])[0]
+            if table in ("flights", "airfields", "aircraft"):
+                return self._csv(data, table)
+            return self._json(200, {k: v for k, v in data.items() if k != "flights_all"})
+        if self.path.startswith("/api/lastpos") and self.app is not None:
+            from urllib.parse import parse_qs, urlsplit
+
+            q = parse_qs(urlsplit(self.path).query)
+            types = [t.strip().upper() for v in q.get("types", []) for t in v.split(",") if t.strip()][:12]
+            try:
+                hours = max(1.0, min(float((q.get("hours") or ["24"])[0]), 24 * 8))
+                return self._json(200, self.app.last_positions(types or list(self.app.watch_types), hours))
+            except Exception as e:  # noqa: BLE001
+                return self._json(500, {"error": str(e)})
         if self.path.startswith("/api/aircraft") and self.app is not None:
             from urllib.parse import parse_qs, urlsplit
 
@@ -185,6 +207,18 @@ class QuietHandler(SimpleHTTPRequestHandler):
             report["watched"] = any(w.get("hex") == hex_code or w["query"] == hex_code for w in self.app.watchlist)
             return self._json(200, report)
         return super().do_GET()
+
+    def _csv(self, data: dict, table: str):
+        summary = {"flights": data.get("flights_all", data["flights"]), "airfields": data["airfields"], "aircraft": data["aircraft"]}
+        with tempfile_dir() as d:
+            tracker.write_csvs(summary, d, "x")
+            body = (d / f"military_{table}_x.csv").read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/csv; charset=utf-8")
+        self.send_header("Content-Disposition", f'attachment; filename="military_{table}_{data["period"]}_filtered.csv"')
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def do_POST(self):
         if not self.path.startswith("/api/") or self.app is None:
@@ -203,6 +237,20 @@ class QuietHandler(SimpleHTTPRequestHandler):
             return self._json(404, {"error": "unknown action"})
         self.app.control(action)
         return self._json(200, {"ok": True, "action": action})
+
+
+def tempfile_dir():
+    import contextlib
+    import tempfile
+
+    @contextlib.contextmanager
+    def cm():
+        with tempfile.TemporaryDirectory() as d:
+            yield Path(d)
+    return cm()
+
+
+PERIODS = {"24h": ("last 24 hours", 24), "3d": ("last 3 days", 72), "7d": ("last 7 days", 168)}
 
 
 def start_server(directory: Path, port: int, app=None) -> int:
@@ -453,10 +501,69 @@ class LiveApp:
             }
         self.progress("Drawing the Osprey / H-60 map")
         watched = self.store.watched(now - 24 * 3600, self.watch_types)
-        render.render_watched(watched, self.out / "cards" / "watched-24h.png", now=now, title=self.args.title, brand=self.args.brand)
+        render.render_watched(watched, self.out / "cards" / "watched-24h.png", now=now, title=self.args.title, brand=self.args.brand,
+                              types=list(self.watch_types))
         out["watched"] = [{k: v for k, v in w.items() if k != "track"} for w in watched]
+        out["catalog"] = self.store.catalog(now - 7 * 86400)
         out["watch_types"] = {t: tracker.WATCH_TYPES.get(t, t) for t in self.watch_types}
         self._write("military.json", out)
+
+    # ------------------------------------------------------------ filtered views (asked for by the dashboard)
+
+    def filtered_military(self, period: str, filt) -> dict:
+        """The military summary + heatmap for one period and filter. Cached for 5 minutes per filter."""
+        period = period if period in PERIODS else "24h"
+        label, hours = PERIODS[period]
+        key = f"{period}|{filt.key()}"
+        cache = getattr(self, "_mil_cache", None)
+        if cache is None:
+            cache = self._mil_cache = {}
+        hit = cache.get(key)
+        if hit and time.time() - hit["ts"] < 300:
+            return hit["data"]
+        now = time.time()
+        store = tracker.Store(self.out / "data" / "tracks.sqlite")  # own connection: this runs in the web server's thread
+        try:
+            summ = tracker.summarize(store, now - hours * 3600, filt)
+            parts = []
+            if filt.types:
+                parts.append(", ".join(filt.types))
+            if filt.operators:
+                parts.append(", ".join(filt.operators))
+            if filt.airfield:
+                parts.append(f"via {filt.airfield}")
+            if filt.text:
+                parts.append(f"“{filt.text}”")
+            fl_label = " · ".join(parts)
+            name = f"cards/heat-{hashlib.sha1(key.encode()).hexdigest()[:10]}.png"
+            render.render_heatmap(store.points(now - hours * 3600, filt=filt, hexes=summ["hexes"]), self.out / name, summ, label,
+                                  title=self.args.title, brand=self.args.brand, filter_label=fl_label,
+                                  segments=store.segment_chunks(now - hours * 3600, filt=filt, hexes=summ["hexes"]))
+        finally:
+            store.db.close()
+        data = {
+            "period": period, "label": label, "filter": fl_label, "heatmap": name, "updated_ts": now,
+            "positions": summ["positions"], "aircraft_seen": summ["aircraft_seen"], "flight_count": len(summ["flights"]),
+            "flights": summ["flights"][:400], "flights_all": summ["flights"], "airfields": summ["airfields"][:150],
+            "types": summ["types"][:60], "operators": summ["operators"][:40], "aircraft": summ["aircraft"][:300],
+        }
+        cache[key] = {"ts": now, "data": data}
+        for k in sorted(cache, key=lambda k: cache[k]["ts"])[:-20]:  # keep the 20 most recent filters
+            del cache[k]
+        return data
+
+    def last_positions(self, types: list[str], hours: float) -> dict:
+        """Last position of every aircraft of these types in the last `hours`, with a map."""
+        now = time.time()
+        store = tracker.Store(self.out / "data" / "tracks.sqlite")
+        try:
+            items = store.watched(now - hours * 3600, tuple(types))
+        finally:
+            store.db.close()
+        name = f"cards/types-{hashlib.sha1((','.join(sorted(types)) + str(hours)).encode()).hexdigest()[:10]}.png"
+        render.render_watched(items, self.out / name, hours=hours, now=now, title=self.args.title, brand=self.args.brand, types=types)
+        return {"types": types, "hours": hours, "map": name, "updated_ts": now,
+                "items": [{k: v for k, v in i.items() if k != "track"} for i in items]}
 
     # ------------------------------------------------------------ watchlist
 

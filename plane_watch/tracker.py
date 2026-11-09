@@ -79,6 +79,59 @@ def nearest_airfield(lat: float, lon: float, radius_km: float = AIRFIELD_RADIUS_
     return best, best_d
 
 
+class Filter:
+    """What the dashboard's filter bar asks for. Empty fields match everything."""
+
+    def __init__(self, types=(), operators=(), airfield: str = "", text: str = ""):
+        self.types = tuple(t.strip().upper() for t in types if t and t.strip())
+        self.operators = tuple(o.strip() for o in operators if o and o.strip())
+        self.airfield = (airfield or "").strip().upper()
+        self.text = (text or "").strip().lower()
+
+    @classmethod
+    def from_query(cls, q: dict) -> "Filter":
+        def many(k):
+            return [x for v in q.get(k, []) for x in v.split(",")]
+
+        return cls(many("type"), many("operator"), (q.get("airfield") or [""])[0], (q.get("q") or [""])[0])
+
+    @property
+    def empty(self) -> bool:
+        return not (self.types or self.operators or self.airfield or self.text)
+
+    def key(self) -> str:
+        return "|".join([",".join(sorted(self.types)), ",".join(sorted(self.operators)), self.airfield, self.text])
+
+    def match_meta(self, m: dict) -> bool:
+        if self.types and (m.get("type") or "").upper() not in self.types:
+            return False
+        if self.operators and not any(o.lower() in (m.get("operator") or "").lower() for o in self.operators):
+            return False
+        if self.text:
+            hay = " ".join(str(m.get(k) or "") for k in ("hex", "callsign", "reg", "type", "descr", "operator")).lower()
+            if self.text not in hay:
+                return False
+        return True
+
+    def sql(self) -> tuple[str, list]:
+        """Extra WHERE conditions on the `ac` table (airfield is handled separately, it needs flights)."""
+        conds, params = [], []
+        if self.types:
+            conds.append(f"UPPER(ac.type) IN ({','.join('?' * len(self.types))})")
+            params += list(self.types)
+        if self.operators:
+            conds.append("(" + " OR ".join("LOWER(ac.operator) LIKE ?" for _ in self.operators) + ")")
+            params += [f"%{o.lower()}%" for o in self.operators]
+        if self.text:
+            conds.append("LOWER(COALESCE(ac.hex,'') || ' ' || COALESCE(ac.callsign,'') || ' ' || COALESCE(ac.reg,'') || ' ' || "
+                         "COALESCE(ac.type,'') || ' ' || COALESCE(ac.descr,'') || ' ' || COALESCE(ac.operator,'')) LIKE ?")
+            params.append(f"%{self.text}%")
+        return ("".join(" AND " + c for c in conds), params)
+
+
+NO_FILTER = Filter()
+
+
 class Store:
     def __init__(self, path: Path, keep_days: float = 8):
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -176,24 +229,33 @@ class Store:
 
     # ------------------------------------------------------------ queries
 
-    def points(self, since: float, military_only: bool = True, cell_deg: float = 0.1) -> list[tuple[float, float, int]]:
+    def _filter_sql(self, filt: Filter | None, hexes: set | None) -> tuple[str, list]:
+        clause, params = (filt or NO_FILTER).sql()
+        if hexes is not None:
+            clause += f" AND p.hex IN ({','.join('?' * len(hexes))})" if hexes else " AND 0"
+            params += sorted(hexes)
+        return clause, params
+
+    def points(self, since: float, military_only: bool = True, cell_deg: float = 0.1, filt: Filter | None = None,
+               hexes: set | None = None) -> list[tuple[float, float, int]]:
         """(lon, lat, count) per cell_deg grid cell: the heatmap input, binned inside SQLite."""
         q = f"SELECT ROUND(p.lon / {cell_deg}) * {cell_deg}, ROUND(p.lat / {cell_deg}) * {cell_deg}, COUNT(*) FROM pos p"
-        if military_only:
-            q += " JOIN ac ON ac.hex = p.hex AND ac.military = 1"
-        return self.db.execute(q + " WHERE p.ts >= ? GROUP BY 1, 2", (since,)).fetchall()
+        q += " JOIN ac ON ac.hex = p.hex" + (" AND ac.military = 1" if military_only else "")
+        clause, params = self._filter_sql(filt, hexes)
+        return self.db.execute(q + " WHERE p.ts >= ?" + clause + " GROUP BY 1, 2", (since, *params)).fetchall()
 
-    def segment_chunks(self, since: float, chunk: int = 200_000):
+    def segment_chunks(self, since: float, chunk: int = 200_000, filt: Filter | None = None, hexes: set | None = None):
         """Yield numpy arrays of [lon, lat, prev_lon, prev_lat, seconds_since_prev] for military positions:
         consecutive points of the same aircraft, so the heatmap can draw paths instead of dots."""
         import numpy as np
 
         q = """SELECT p.lon, p.lat, LAG(p.lon) OVER w, LAG(p.lat) OVER w, p.ts - LAG(p.ts) OVER w
                FROM pos p JOIN ac ON ac.hex = p.hex AND ac.military = 1
-               WHERE p.ts >= ?
+               WHERE p.ts >= ? {clause}
                WINDOW w AS (PARTITION BY p.hex ORDER BY p.ts)"""
+        clause, params = self._filter_sql(filt, hexes)
         try:
-            cur = self.db.execute(q, (since,))
+            cur = self.db.execute(q.replace("{clause}", clause), (since, *params))
         except sqlite3.OperationalError:  # very old SQLite without window functions: the heatmap uses dots instead
             return
         while True:
@@ -233,15 +295,30 @@ class Store:
             out.setdefault(h, []).append((ts, lat, lon, alt))
         return out
 
-    def count_positions(self, since: float) -> int:
-        return self.db.execute("SELECT COUNT(*) FROM pos WHERE ts >= ?", (since,)).fetchone()[0]
+    def count_positions(self, since: float, filt: Filter | None = None, hexes: set | None = None) -> int:
+        if (filt is None or filt.empty) and hexes is None:
+            return self.db.execute("SELECT COUNT(*) FROM pos WHERE ts >= ?", (since,)).fetchone()[0]
+        clause, params = self._filter_sql(filt, hexes)
+        return self.db.execute("SELECT COUNT(*) FROM pos p JOIN ac ON ac.hex = p.hex AND ac.military = 1 WHERE p.ts >= ?" + clause,
+                               (since, *params)).fetchone()[0]
+
+    def catalog(self, since: float) -> dict:
+        """Types and operators seen, for the dashboard's filter menus."""
+        types = [{"type": t, "descr": d or "", "aircraft": n} for t, d, n in self.db.execute(
+            "SELECT type, MAX(descr), COUNT(*) FROM ac WHERE military = 1 AND last_seen >= ? AND type <> '' GROUP BY type ORDER BY 3 DESC",
+            (since,))]
+        ops = [{"operator": o, "aircraft": n} for o, n in self.db.execute(
+            "SELECT operator, COUNT(*) FROM ac WHERE military = 1 AND last_seen >= ? AND operator <> '' GROUP BY operator ORDER BY 2 DESC",
+            (since,))]
+        return {"types": types, "operators": ops}
 
     def watched(self, since: float, types=tuple(WATCH_TYPES)) -> list[dict]:
         marks = ",".join("?" * len(types))
         info = [dict(zip(["hex", "callsign", "reg", "type", "descr", "operator", "last_seen", "lat", "lon", "alt", "heading", "gs"], r))
                 for r in self.db.execute(f"""SELECT hex, callsign, reg, type, descr, operator, last_seen, last_lat, last_lon, last_alt,
                                                     last_trk, last_gs
-                                             FROM ac WHERE type IN ({marks}) AND last_seen >= ? ORDER BY last_seen DESC""",
+                                             FROM ac WHERE UPPER(type) IN ({marks}) AND military = 1 AND last_seen >= ?
+                                             ORDER BY last_seen DESC""",
                                          (*types, since))]
         tracks = self.tracks(since, [i["hex"] for i in info])
         for i in info:
@@ -285,12 +362,14 @@ def _end(lat, lon, alt) -> dict | None:
     return {"icao": a["icao"], "name": a["name"], "country": a.get("country", ""), "km": round(d, 1)} if a else None
 
 
-def flights(store: Store, since: float, info: dict | None = None, hex_code: str | None = None) -> list[dict]:
+def flights(store: Store, since: float, info: dict | None = None, hex_code: str | None = None,
+            filt: Filter | None = None) -> list[dict]:
     info = info or store.aircraft_info()
+    filt = filt or NO_FILTER
     out = []
     for h, pts in store.iter_tracks(since, hex_code):
         meta = info.get(h, {})
-        if not meta.get("military") and not hex_code:
+        if not hex_code and (not meta.get("military") or not filt.match_meta(meta)):
             continue
         for f in split_flights(pts):
             dist = sum(geo.haversine_km(a[1], a[2], b[1], b[2]) for a, b in zip(f, f[1:]))
@@ -303,14 +382,19 @@ def flights(store: Store, since: float, info: dict | None = None, hex_code: str 
                 "from": _end(start[1], start[2], start[3]), "to": _end(end[1], end[2], end[3]),
                 "max_alt": max((p[3] or 0) for p in f), "km": round(dist), "points": len(f),
             })
+    if filt.airfield:
+        a = filt.airfield.lower()
+        out = [f for f in out if any(f[k] and (f[k]["icao"].lower() == a or a in f[k]["name"].lower()) for k in ("from", "to"))]
     out.sort(key=lambda r: -r["end_ts"])
     return out
 
 
-def summarize(store: Store, since: float) -> dict:
-    """Everything the dashboard's military section and the CSVs need, for one period."""
+def summarize(store: Store, since: float, filt: Filter | None = None) -> dict:
+    """Everything the dashboard's military section and the CSVs need, for one period (optionally filtered)."""
+    filt = filt or NO_FILTER
     info = store.aircraft_info()
-    fl = flights(store, since, info)
+    fl = flights(store, since, info, filt=filt)
+    airfield_hexes = {f["hex"] for f in fl} if filt.airfield else None
     airfields: dict[str, dict] = {}
     for f in fl:
         for key, kind in (("from", "departures"), ("to", "arrivals")):
@@ -331,7 +415,8 @@ def summarize(store: Store, since: float) -> dict:
         airfield_rows.append(r)
     airfield_rows.sort(key=lambda r: -r["movements"])
 
-    seen = {h: m for h, m in info.items() if m["military"] and (m["last_seen"] or 0) >= since}
+    seen = {h: m for h, m in info.items() if m["military"] and (m["last_seen"] or 0) >= since and filt.match_meta(m)
+            and (airfield_hexes is None or h in airfield_hexes)}
     types: dict[str, dict] = {}
     operators: dict[str, int] = {}
     for m in seen.values():
@@ -356,7 +441,8 @@ def summarize(store: Store, since: float) -> dict:
     aircraft_rows.sort(key=lambda r: -r["km"])
     return {
         "since": since,
-        "positions": store.count_positions(since),
+        "positions": store.count_positions(since, filt, airfield_hexes),
+        "hexes": airfield_hexes,
         "aircraft_seen": len(seen),
         "flights": fl,
         "airfields": airfield_rows,
