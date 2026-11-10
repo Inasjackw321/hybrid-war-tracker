@@ -119,7 +119,7 @@ class AdsbTests(unittest.TestCase):
         with mock.patch.object(adsb.http, "get_json", side_effect=fake):
             client = adsb.AdsbClient(("adsb.lol", "airplanes.live", "adsb.fi"), gap_s=0)
             found = client.squawks(["7700"])
-        self.assertEqual(len(found), 2)
+        self.assertEqual([a.hex for a in found], ["A1B2C3"])  # the 7600 aircraft in the reply is dropped
         self.assertEqual(len(calls), 3)
         self.assertEqual(len(client.errors), 1)
         self.assertIn("opendata.adsb.fi/api/v2/sqk/7700", calls[2])
@@ -851,3 +851,112 @@ class AnalysisTests(unittest.TestCase):
             self.assertEqual(r["links"][0]["icao"], "ETAR")
             self.assertEqual(len(r["summary"]["by_hour"]), 24)
             self.assertFalse(app.airfield_report("ZZZZ", "24h")["found"])
+
+
+class AccuracyTests(unittest.TestCase):
+    def test_freshest_report_wins_and_stale_squawks_are_dropped(self):
+        old = {"now": READSB["now"], "ac": [{"hex": "a1b2c3", "squawk": "7700", "emergency": "general", "seen": 50, "seen_pos": 50,
+                                             "lat": 40.0, "lon": -75.0}]}
+        new = {"now": READSB["now"], "ac": [{"hex": "a1b2c3", "squawk": "1200", "emergency": "none", "seen": 1, "seen_pos": 1,
+                                             "lat": 40.1, "lon": -75.1, "flight": "UAL123"}]}
+
+        def fake(url, headers=None):
+            return old if "adsb.lol" in url else new
+
+        with mock.patch.object(adsb.http, "get_json", side_effect=fake):
+            client = adsb.AdsbClient(("adsb.lol", "airplanes.live"), gap_s=0)
+            merged = client.query("sqk", "7700")
+            self.assertEqual((merged[0].squawk, merged[0].emergency, merged[0].lat), ("1200", "", 40.1))
+            self.assertEqual(client.squawks(["7700"]), [])  # it changed code: not an emergency any more
+        stale = {"now": READSB["now"], "ac": [{"hex": "a1b2c3", "squawk": "7700", "seen": 300, "lat": 40, "lon": -75}]}
+        with mock.patch.object(adsb.http, "get_json", return_value=stale):
+            self.assertEqual(adsb.AdsbClient(("adsb.lol",), gap_s=0).squawks(["7700"]), [])  # not heard from for 5 min
+
+    def _app(self, d):
+        from plane_watch.app import LiveApp, parser
+
+        app = LiveApp(parser().parse_args(["--out", d, "--udp-port", "0", "--no-browser", "--backfill-hours", "0", "--no-photos"]))
+        app.cycle_no = 1
+        return app
+
+    def _alert(self, **kw):
+        ac = Aircraft("A1B2C3", "UAL1", lat=40.0, lon=-75.0, alt_ft=30000, speed_kt=450, seen_ts=1000.0, **kw)
+        return Alert(ac, classify.classify_aircraft(ac))
+
+    def test_confirmation_rules(self):
+        with tempfile.TemporaryDirectory() as d:
+            app = self._app(d)
+            a = self._alert(squawk="7700", emergency="general")
+            app.assess(a, {}, 1000.0)
+            self.assertTrue(a.confirmed)  # squawk + matching status
+
+            entry = {}
+            a = self._alert(squawk="7700")
+            app.assess(a, entry, 1000.0)
+            self.assertFalse(a.confirmed)  # squawk alone, first check
+            self.assertIn("next check", a.note)
+            app.cycle_no = 2
+            a = self._alert(squawk="7700")
+            app.assess(a, entry, 1060.0)
+            self.assertTrue(a.confirmed)  # still squawking
+
+            a = self._alert(squawk="4521", emergency="unlawful")
+            self.assertEqual([f.category for f in a.flags], ["hijack"])
+            app.assess(a, {}, 1000.0)
+            self.assertFalse(a.confirmed)  # status without the squawk: a glitch until proven otherwise
+            self.assertIn("glitch", a.note)
+            self.assertFalse(classify.is_emergency(a))
+
+            ac = Aircraft("A0B848", "UAL9", squawk="7700", emergency="general", seen_ts=1000.0)
+            a = Alert(ac, classify.classify_aircraft(ac))
+            app.assess(a, {}, 1000.0)
+            self.assertFalse(a.confirmed)  # no position at all
+            self.assertIn("No position", a.note)
+
+    def test_taxiing_with_an_altitude_is_still_a_ground_test(self):
+        from plane_watch.models import TrackPoint
+
+        with tempfile.TemporaryDirectory() as d:
+            app = self._app(d)
+            ac = Aircraft("A0B848", "UAL9", lat=40.7, lon=-74.2, alt_ft=25, speed_kt=12, squawk="7600", seen_ts=1000.0,
+                          track=[TrackPoint(900.0, 40.7, -74.2, 25, 10.0), TrackPoint(1000.0, 40.7, -74.2, 25, 12.0)])
+            a = Alert(ac, classify.classify_aircraft(ac))
+            app.assess(a, {}, 1000.0)
+            self.assertTrue(a.ground_test)
+            # one that was flying 10 minutes ago and has just landed is a real emergency
+            ac2 = Aircraft("A0B849", "UAL8", lat=40.7, lon=-74.2, on_ground=True, alt_ft=0, speed_kt=20, squawk="7700",
+                           emergency="general", seen_ts=1000.0,
+                           track=[TrackPoint(400.0, 40.6, -74.3, 1500, 140.0), TrackPoint(1000.0, 40.7, -74.2, 0, 20.0)])
+            a2 = Alert(ac2, classify.classify_aircraft(ac2))
+            app.assess(a2, {}, 1000.0)
+            self.assertFalse(a2.ground_test)
+            self.assertTrue(a2.confirmed)
+
+
+class AcarsSourceTests(unittest.TestCase):
+    def test_key_from_dashboard_settings_and_bearer_header(self):
+        from plane_watch.app import LiveApp, parser
+
+        with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, {"AIRFRAMES_API_KEY": ""}):
+            app = LiveApp(parser().parse_args(["--out", d, "--udp-port", "0", "--no-browser", "--backfill-hours", "0"]))
+            self.assertEqual(app.airframes_key(), "")
+            self.assertFalse(app.save_settings({"airframes_key": "no"})[0])
+            ok, _ = app.save_settings({"airframes_key": "abcd1234efgh"})
+            self.assertTrue(ok)
+            self.assertEqual(app.airframes_key(), "abcd1234efgh")
+            seen = {}
+
+            def fake(url, headers=None):
+                seen.update(headers or {})
+                return {"messages": [{"text": "MAYDAY ENG FIRE", "tail": "N1", "flightNumber": "AA1", "timestamp": time.time(),
+                                      "airframe": {"icao": "a00001"}}]}
+
+            with mock.patch.object(acars.http, "get_json", side_effect=fake):
+                msgs = app.acars()
+            self.assertEqual(seen["Authorization"], "Bearer abcd1234efgh")
+            self.assertEqual(msgs[0].hex, "A00001")
+            with mock.patch.object(acars.http, "get_json", side_effect=acars.http.FetchError("HTTP 401 from x")):
+                app.acars()
+            self.assertTrue(any("rejected the API key" in e for e in app.client.errors))
+            app.save_settings({"airframes_key": ""})
+            self.assertEqual(app.airframes_key(), "")

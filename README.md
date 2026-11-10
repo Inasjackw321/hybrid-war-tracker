@@ -110,6 +110,8 @@ While it runs, Plane Watch records every military aircraft the feeds report (one
 
 **History on start:** each time it starts, it downloads the last 24 hours of track history (from the feeds' trace files) for every military aircraft, Osprey and H-60 it can see. That way the heatmap and tables aren't empty at first. The dashboard shows the download's progress. It only finds aircraft the feeds show at the moment, so anything older than that, or aircraft that have switched off, comes from leaving Plane Watch running.
 
+**Accuracy checks:** the three feeds can lag each other, so for every aircraft the freshest report wins, and a squawk is re-checked against it (an aircraft that has already changed code, or that no feed has heard from for a minute, is dropped). An alert counts (counters, emergency map, notifications, CSV) only once it's **confirmed**: the squawk comes with the matching transponder emergency status, or it's still squawking at the next check. An emergency status without an emergency squawk (common on military transponders) stays **unconfirmed** and is listed separately with the reason, as are aircraft with no position.
+
 **Ground tests:** an aircraft squawking an emergency code while parked or taxiing, which wasn't seen flying with it, is listed separately as "on the ground, probably a test". It's left off the emergency map and counters. Airbus and Boeing test aircraft (F-WZ…, N-numbers at Everett) do this a lot.
 
 ![Sample card: ACARS bomb threat with diversion](docs/plane-watch-bomb-threat.png)
@@ -122,7 +124,9 @@ While it runs, Plane Watch records every military aircraft the feeds report (one
 
 - **Your own receiver:** the app listens on **UDP port 5550** for decoder JSON. Point your decoder at the computer running Plane Watch. For example, acarsdec: `--output json:udp:host=127.0.0.1,port=5550`. dumpvdl2 or dumphfdl: `--output decoded:json:udp:address=127.0.0.1,port=5550`. ACARS Hub's feeders work the same way.
 - **A file:** `python planewatch.pyz --acars-file acars.jsonl`
-- **airframes.io:** set the environment variable `AIRFRAMES_API_KEY` before you start the app.
+- **airframes.io:** paste an API key into the ACARS box on the dashboard (or set `AIRFRAMES_API_KEY`). airframes.io gives free keys to people who feed it from their own station for 7+ days, and sells paid ones; see [docs.airframes.io](https://docs.airframes.io/api/authentication). The key is stored only on your PC, in `planewatch-data/data/settings.json`.
+
+The ADS-B feeds don't carry ACARS, so without one of these there's no ACARS data.
 
 ### Take-offs, landings and flight analysis
 

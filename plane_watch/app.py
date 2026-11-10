@@ -237,6 +237,13 @@ class QuietHandler(SimpleHTTPRequestHandler):
         if self.headers.get(CONTROL_HEADER) != "1":
             return self._json(403, {"error": "missing header"})
         action = self.path[len("/api/"):].split("?")[0]
+        if action == "settings":
+            try:
+                body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
+            except ValueError:
+                return self._json(400, {"error": "bad JSON"})
+            ok, msg = self.app.save_settings(body)
+            return self._json(200 if ok else 400, {"ok": ok, "message": msg})
         if action in ("watch", "unwatch"):
             try:
                 body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
@@ -375,14 +382,63 @@ class LiveApp:
                 msgs += acars_src.read_file(f, since)
             except OSError as e:
                 self.client.errors.append(f"ACARS file {f}: {e}")
-        if os.environ.get("AIRFRAMES_API_KEY"):
+        key = self.airframes_key()
+        if key:
             try:
-                msgs += acars_src.fetch_airframes(since_ts=since)
+                msgs += acars_src.fetch_airframes(key, since_ts=since)
             except Exception as e:  # noqa: BLE001
                 self.client.errors.append(f"airframes.io: {e}")
         return msgs
 
+    # The transponder's emergency status that goes with each emergency squawk (most set it automatically).
+    STATUS_FOR_SQUAWK = {"7500": {"unlawful"}, "7600": {"nordo"}, "7700": {"general", "lifeguard", "minfuel", "downed"}}
+
+    def assess(self, alert: Alert, entry: dict, now: float):
+        """Decide whether an alert is believable enough for the counters, map and notifications.
+
+        - Squawk + matching transponder emergency status: confirmed straight away.
+        - Squawk alone: confirmed once it's still squawking at the next check (a pilot dialling past 7x00 lasts seconds).
+        - Emergency status alone, with a normal squawk: never confirmed. This is a common transponder glitch,
+          especially on military aircraft.
+        - Squawking on the ground without having been seen flying: a ground test (shown separately)."""
+        ac = alert.aircraft
+        # flying = moving at flying speed (taxiing aircraft can report an altitude but not 80+ kt)
+        recent = (ac.seen_ts or now) - 20 * 60
+        if (not ac.on_ground and (ac.speed_kt or 0) >= 80) or any(
+                p.gs is not None and p.gs >= 80 and p.alt_ft != 0 and p.ts >= recent for p in ac.track):
+            entry["was_airborne"] = True
+        crawling = ac.on_ground or (ac.speed_kt is not None and ac.speed_kt < 40)
+        origins = {f.origin for f in alert.flags}
+        alert.ground_test = bool(crawling and not entry.get("was_airborne") and origins <= {"squawk", "adsb-emergency"})
+
+        entry["streak"] = entry.get("streak", 0) + 1 if entry.get("last_cycle") == self.cycle_no - 1 else 1
+        entry["last_cycle"] = self.cycle_no
+        squawked = "squawk" in origins
+        matched = squawked and ac.emergency in self.STATUS_FOR_SQUAWK.get(ac.squawk, set())
+        notes = []
+        if "acars" in origins and alert.top.origin == "acars":
+            confirmed = True  # an ACARS message is its own evidence (shown with the text so it can be judged)
+        elif squawked:
+            confirmed = matched or entry["streak"] >= 2 or entry.get("confirmed", False)
+            if not confirmed:
+                notes.append("Seen squawking once so far; it's confirmed if it's still squawking at the next check.")
+        elif "adsb-emergency" in origins:
+            confirmed = False
+            notes.append(f"The transponder reports emergency status \"{ac.emergency}\" but the squawk is "
+                         f"{ac.squawk or 'not reported'}, not an emergency code. That's usually a transponder glitch, "
+                         "especially on military aircraft.")
+        else:
+            confirmed = True
+        if ac.lat is None and "acars" not in origins:
+            confirmed = False
+            notes.append("No position reported.")
+        if confirmed:
+            entry["confirmed"] = True
+        alert.confirmed = confirmed
+        alert.note = " ".join(notes)
+
     def cycle(self) -> dict:
+        self.cycle_no = getattr(self, "cycle_no", 0) + 1
         self.client.errors = []
         self.client.ok_requests = 0
         started = time.time()
@@ -425,12 +481,7 @@ class LiveApp:
             self.known[alert.aircraft.hex] = entry
             # On the ground with an emergency code, never seen flying with it: usually a ground test or maintenance
             # (Airbus/Boeing test aircraft do this a lot). One that just landed after a real emergency is kept.
-            ac = alert.aircraft
-            recent = (ac.seen_ts or now) - 20 * 60
-            if not ac.on_ground or any(p.alt_ft and p.ts >= recent for p in ac.track):
-                entry["was_airborne"] = True
-            alert.ground_test = bool(ac.on_ground and not entry.get("was_airborne")
-                                     and all(f.origin in ("squawk", "adsb-emergency") for f in alert.flags))
+            self.assess(alert, entry, now)
             # redraw when the aircraft moved or the evidence changed
             sig = (alert.aircraft.seen_ts, tuple(sorted((f.category, f.origin, f.ts or 0) for f in alert.flags)),
                    (alert.divert_airport or {}).get("icao"))
@@ -481,7 +532,7 @@ class LiveApp:
                 "messages": len(msgs), "flagged": len(flagged),
                 "udp_port": self.args.udp_port if self.listener and not self.listener.error else None,
                 "udp_received": self.listener.received if self.listener else 0,
-                "airframes": bool(os.environ.get("AIRFRAMES_API_KEY")),
+                "airframes": bool(self.airframes_key()),
                 "files": self.args.acars_file or [],
             },
             "errors": _tidy(self.client.errors) + ([self.listener.error] if self.listener and self.listener.error else []),
@@ -492,7 +543,8 @@ class LiveApp:
         status["military_now"], status["watched_now"] = getattr(self, "_military_now", (0, 0))
         status["backfill"] = self.backfill.status() if self.backfill else None
         status["watchlist"] = self.watch_status(watch_found)
-        status["squawk_now"] = {sq: sum(1 for a in alerts if a.aircraft.squawk == sq and not a.ground_test) for sq in self.squawks}
+        status["squawk_now"] = {sq: sum(1 for a in alerts if a.aircraft.squawk == sq and not a.ground_test and a.confirmed)
+                                for sq in self.squawks}
         self.last_status = status
         self._write("live.json", status)
         if self.client.ok_requests and time.time() - self._last_summary >= self.args.summary_minutes * 60:
@@ -614,6 +666,27 @@ class LiveApp:
         render.render_watched(items, self.out / name, hours=hours, now=now, title=self.args.title, brand=self.args.brand, types=types)
         return {"types": types, "hours": hours, "map": name, "updated_ts": now,
                 "items": [{k: v for k, v in i.items() if k != "track"} for i in items]}
+
+    # ------------------------------------------------------------ settings
+
+    def airframes_key(self) -> str:
+        """airframes.io API key: the environment variable, or the one pasted into the dashboard (data/settings.json)."""
+        return os.environ.get("AIRFRAMES_API_KEY") or self._load("settings.json", {}).get("airframes_key", "")
+
+    def save_settings(self, body: dict) -> tuple[bool, str]:
+        settings = self._load("settings.json", {})
+        if "airframes_key" in body:
+            key = str(body["airframes_key"] or "").strip()
+            if key and (len(key) < 8 or len(key) > 200 or any(c.isspace() for c in key)):
+                return False, "That doesn't look like an API key."
+            if key:
+                settings["airframes_key"] = key
+            else:
+                settings.pop("airframes_key", None)
+            self._write("settings.json", settings)
+            self.wake.set()
+            return True, "airframes.io key saved; ACARS messages appear from the next check." if key else "airframes.io key removed."
+        return False, "Nothing to save."
 
     # ------------------------------------------------------------ watchlist
 
@@ -738,7 +811,7 @@ class LiveApp:
             "phase": phase, "message": message, "updated_at": _iso(now), "updated_ts": now, "next_update_ts": now,
             "interval_s": self.args.interval, "squawks": list(self.squawks), "sources": self.client.sources,
             "acars": {"messages": 0, "flagged": 0, "udp_port": self.args.udp_port if self.listener and not self.listener.error else None,
-                      "udp_received": 0, "airframes": bool(os.environ.get("AIRFRAMES_API_KEY")), "files": self.args.acars_file or []},
+                      "udp_received": 0, "airframes": bool(self.airframes_key()), "files": self.args.acars_file or []},
             "errors": list(self.client.errors), "alerts": [], "cleared": [], "paused": self.paused.is_set(),
         }
 
@@ -747,7 +820,7 @@ class LiveApp:
         track = old.aircraft.track
         ac = new.aircraft
         if ac.lat is not None and (not track or track[-1].ts < (ac.seen_ts or 0)):
-            track.append(TrackPoint(ac.seen_ts or time.time(), ac.lat, ac.lon, ac.alt_ft))
+            track.append(TrackPoint(ac.seen_ts or time.time(), ac.lat, ac.lon, ac.alt_ft, ac.speed_kt))
         ac.track = track
         if ac.lat is None and track:
             ac.lat, ac.lon, ac.alt_ft = track[-1].lat, track[-1].lon, track[-1].alt_ft
@@ -791,10 +864,14 @@ class LiveApp:
         for a in alerts:
             h = self.history.get(a.id)
             if h is None:
-                new_ids.append(a)
                 h = self.history[a.id] = {"first_seen": _iso(now), "category": a.top.category, "hex": a.aircraft.hex,
                                           "label": a.aircraft.label, "type": a.aircraft.description or a.aircraft.type_code}
+            confirmed = a.confirmed and not a.ground_test
+            if confirmed and not h.get("logged"):  # the CSV only gets alerts once they're confirmed
+                new_ids.append(a)
+                h["logged"] = True
             h.update(last_seen=_iso(now), categories=sorted({f.category for f in a.flags}),
+                     confirmed=bool(h.get("confirmed") or confirmed), ground_test=a.ground_test, note=a.note,
                      squawk=a.aircraft.squawk, lat=a.aircraft.lat, lon=a.aircraft.lon,
                      divert_to=(a.divert_airport or {}).get("icao", ""), evidence=[f.evidence for f in a.flags][:6])
         if len(self.history) > 2000:
@@ -878,7 +955,8 @@ class LiveApp:
             print(f"  {stamp}  {len(alerts)} flagged:")
             for a in alerts:
                 ac = a["aircraft"]
-                note = "   (on the ground, probably a test)" if a.get("ground_test") else ""
+                note = ("   (on the ground, probably a test)" if a.get("ground_test")
+                        else "   (unconfirmed)" if a.get("confirmed") is False else "")
                 print(f"           {a['category_label']:<30} {ac['callsign'] or ac['hex']:<9} {ac['description'] or ac['type_code']}{note}")
         failed = len(status["errors"])
         if failed:

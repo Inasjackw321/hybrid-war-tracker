@@ -327,9 +327,11 @@ function card(a) {
     ${a.card ? `<img src="${esc(a.card)}?v=${a.card_v}" alt="Card for ${esc(ac.callsign || ac.hex)}" loading="lazy" data-full="${esc(a.card)}?v=${a.card_v}">` : ""}
     <div class="body">
       <div class="top"><span class="ident">${esc(ac.callsign || ac.registration || ac.hex)}</span><span class="cat">${esc(a.category_label)}</span></div>
-      <div class="meta">${esc([ac.description || ac.type_code, ac.registration, ac.hex, ac.squawk && "squawk " + ac.squawk,
+      <div class="meta">${esc([ac.description || ac.type_code, ac.registration, ac.hex, ac.squawk ? "squawk " + ac.squawk : "no squawk reported",
+        ac.emergency && "transponder status: " + ac.emergency,
         ac.alt_ft != null && (ac.on_ground ? "on ground" : ac.alt_ft.toLocaleString() + " ft")].filter(Boolean).join(" · "))}</div>
-      <div class="meta">${a.ground ? "On the ground since " + esc(a.first_seen.slice(11, 16)) + " UTC" : a.live ? "Flagged since " + esc(a.first_seen.slice(11, 16)) + " UTC" : "Cleared · last seen " + esc(a.last_seen.slice(11, 16)) + " UTC"}
+      ${a.note ? `<div class="meta" style="color:#ffd60a;margin-top:4px">${esc(a.note)}</div>` : ""}
+      <div class="meta">${a.unconf ? "First seen " + esc(a.first_seen.slice(11, 16)) + " UTC" : a.ground ? "On the ground since " + esc(a.first_seen.slice(11, 16)) + " UTC" : a.live ? "Flagged since " + esc(a.first_seen.slice(11, 16)) + " UTC" : "Cleared · last seen " + esc(a.last_seen.slice(11, 16)) + " UTC"}
         ${a.divert_airport ? ` · diverting to <strong>${esc(a.divert_airport.icao)}</strong> ${esc(a.divert_airport.name)}` : ""}</div>
       <ul class="ev">${ev.map(f => `<li>${f.origin === "acars" ? `ACARS: ${esc(f.category)}` : esc(f.evidence)}</li>`).join("")}</ul>
       ${msg ? `<div class="acars">${highlight(msg.text, a.flags)}</div>` : ""}
@@ -337,7 +339,8 @@ function card(a) {
 }
 
 function render() {
-  const alerts = live.alerts.filter(a => !a.ground_test), ground = live.alerts.filter(a => a.ground_test), counts = {};
+  const alerts = live.alerts.filter(a => !a.ground_test && a.confirmed !== false), ground = live.alerts.filter(a => a.ground_test),
+        unconfirmed = live.alerts.filter(a => !a.ground_test && a.confirmed === false), counts = {};
   alerts.forEach(a => counts[a.category] = (counts[a.category] || 0) + 1);
   $("pills").innerHTML = alerts.length ? `<button class="pill" aria-pressed="${!filter}" data-c="">All ${alerts.length}</button>` +
     Object.entries(counts).map(([c, n]) => `<button class="pill" style="--c:${COLORS[c]}" aria-pressed="${filter === c}" data-c="${c}">${esc(c)} ${n}</button>`).join("") : "";
@@ -363,18 +366,27 @@ function render() {
       ? `<div class="quiet"><strong>The last check failed</strong>${esc(live.message)}<div class="meta">It tries again automatically. The terminal window has the details.</div></div>`
     : alerts.length ? `<h2>Flagged now</h2><div class="grid">${shown.map(card).join("")}</div>`
     : `<div class="quiet"><strong>All quiet</strong>Nothing is squawking an emergency code or flagged in ACARS right now. The page updates by itself.</div>`;
+  if (unconfirmed.length && live.phase === "ok") $("current").innerHTML += `<h2>Unconfirmed · waiting for more evidence</h2>
+    <p class="meta" style="margin-top:-6px">Shown so nothing is hidden, but kept off the counters, the emergency map and notifications until they're corroborated. The reason is on each card.</p>
+    <div class="grid">${unconfirmed.map(a => card({...a, live: false, unconf: true})).join("")}</div>`;
   if (ground.length && live.phase === "ok") $("current").innerHTML += `<h2>On the ground · probably tests or maintenance</h2>
     <p class="meta" style="margin-top:-6px">These are squawking an emergency code while parked or taxiing, and weren't seen flying with it. Test aircraft (registrations like F-WZ…) do this a lot. They're left off the emergency map and counters.</p>
     <div class="grid">${ground.map(a => card({...a, live: false, ground: true})).join("")}</div>`;
   $("cleared").innerHTML = live.cleared.length ? `<h2>Recently cleared</h2><div class="grid">${live.cleared.map(card).join("")}</div>` : "";
   if (live.phase === "ok") $("overview").src = "cards/overview.png?v=" + Math.round(live.updated_ts);
   const a = live.acars;
-  $("sources").innerHTML = `
+  if (!(document.activeElement && document.activeElement.id === "af-key")) $("sources").innerHTML = `
     <div class="panel"><div class="k">ADS-B</div>${esc(live.sources.join(", "))}<div class="meta">every ${Math.round(live.interval_s)}s · squawks ${esc(live.squawks.join(", "))}</div></div>
     <div class="panel"><div class="k">ACARS</div>${a.messages} messages, ${a.flagged} flagged
-      <div class="meta">${a.udp_port ? `Listening on UDP <code>${a.udp_port}</code> (${a.udp_received} received). Point acarsdec, dumpvdl2 or dumphfdl JSON output here.` : "UDP listener off."}
-      ${a.airframes ? " airframes.io on." : " Set AIRFRAMES_API_KEY to add airframes.io."}</div></div>
+      ${!a.airframes && !a.udp_received && !(a.files || []).length ? `<div class="meta" style="color:#ffd60a;margin:4px 0">No ACARS source is connected, so there's no ACARS data. The ADS-B feeds don't carry ACARS.</div>` : ""}
+      <div class="meta">${a.udp_port ? `<strong>Your own receiver:</strong> listening on UDP <code>${a.udp_port}</code> (${a.udp_received} received). Send acarsdec, dumpvdl2 or dumphfdl JSON here.` : "UDP listener off."}</div>
+      <div class="meta" style="margin-top:6px"><strong>airframes.io:</strong> ${a.airframes ? `connected. <a href="#" id="af-remove">Remove key</a>` : `paste an API key (free if you feed them from your own station for 7+ days, or paid):`}</div>
+      ${a.airframes ? "" : `<form id="af-form" class="watch-form" style="margin:6px 0 0"><input class="search" id="af-key" type="password" placeholder="airframes.io API key" autocomplete="off" style="min-width:0;flex:1"><button class="btn" type="submit">Save</button></form><div class="meta" id="af-msg"></div>`}</div>
     <div class="panel"><div class="k">Warnings</div>${live.errors.length ? `<details class="errors" ${live.alerts.length ? "" : "open"}><summary>${live.errors.length} source warning(s)</summary><ul>${live.errors.map(e => `<li>${esc(e)}</li>`).join("")}</ul></details>` : '<span class="meta">None</span>'}</div>`;
+  const afForm = $("af-form");
+  if (afForm) afForm.onsubmit = async e => { e.preventDefault(); const r = await post("settings", {airframes_key: $("af-key").value.trim()}); $("af-msg").textContent = r.message || ""; setTimeout(poll, 1500); };
+  const afRm = $("af-remove");
+  if (afRm) afRm.onclick = async e => { e.preventDefault(); await post("settings", {airframes_key: ""}); setTimeout(poll, 800); };
   bindImages();
   renderWatch();
   notifyChanges();
@@ -384,7 +396,7 @@ function render7700() {
   const day = Date.now() - 864e5;
   const byHex = {};  // one row per aircraft, even if its alert changed category along the way
   for (const h of Object.values(history)) {
-    if (!h || h.squawk !== "7700" || Date.parse(h.last_seen) < day) continue;
+    if (!h || h.squawk !== "7700" || h.confirmed === false || h.ground_test || Date.parse(h.last_seen) < day) continue;
     const r = byHex[h.hex];
     if (!r) { byHex[h.hex] = {...h, categories: [...(h.categories || [])]}; continue; }
     if (h.first_seen < r.first_seen) r.first_seen = h.first_seen;
@@ -645,7 +657,7 @@ paintNotify();
 function ding() { try { const c = new AudioContext(), o = c.createOscillator(), g = c.createGain(); o.frequency.value = 880; g.gain.setValueAtTime(.12, c.currentTime);
   g.gain.exponentialRampToValueAtTime(.0001, c.currentTime + .6); o.connect(g).connect(c.destination); o.start(); o.stop(c.currentTime + .6); } catch {} }
 function notifyChanges() {
-  const alerts = live.alerts.filter(a => !a.ground_test), watch = (live.watchlist || []).filter(w => w.found);
+  const alerts = live.alerts.filter(a => !a.ground_test && a.confirmed !== false), watch = (live.watchlist || []).filter(w => w.found);
   const ids = new Set(alerts.map(a => a.aircraft.hex + a.category)), wq = new Set(watch.map(w => w.query));
   if (seenAlerts && notifyOn) {
     for (const a of alerts) if (!seenAlerts.has(a.aircraft.hex + a.category)) {

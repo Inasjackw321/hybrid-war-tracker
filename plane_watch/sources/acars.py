@@ -146,7 +146,14 @@ def fetch_airframes(api_key: str | None = None, since_ts: float = 0, limit: int 
         from urllib.parse import quote
 
         params += f"&text={quote(query)}"
-    data = http.get_json(AIRFRAMES_URL + params, headers={"X-API-KEY": key, "Authorization": f"Bearer {key}"})
+    try:
+        data = http.get_json(AIRFRAMES_URL + params, headers={"Authorization": f"Bearer {key}"})  # per docs.airframes.io
+    except http.FetchError as e:
+        if "HTTP 401" in str(e) or "HTTP 403" in str(e):
+            raise http.FetchError("airframes.io rejected the API key (check it, or ask api@airframes.io)") from None
+        if "HTTP 429" in str(e):
+            raise http.FetchError("airframes.io rate limit reached; it'll retry next check") from None
+        raise
     items = data if isinstance(data, list) else (data.get("messages") or data.get("data") or data.get("results") or [])
     msgs = [m for m in (normalize(o) for o in items) if m]
     return [m for m in msgs if m.ts >= since_ts]

@@ -88,7 +88,7 @@ def enrich(alert: Alert, client: AdsbClient | None, history: dict | None = None,
     if not ac.track and history and ac.hex in history:
         ac.track = [TrackPoint(**p) for p in history[ac.hex]]
     if ac.lat is not None and (not ac.track or ac.track[-1].ts < (ac.seen_ts or 0)):
-        ac.track.append(TrackPoint(ac.seen_ts or time.time(), ac.lat, ac.lon, ac.alt_ft))
+        ac.track.append(TrackPoint(ac.seen_ts or time.time(), ac.lat, ac.lon, ac.alt_ft, ac.speed_kt))
     if ac.lat is None and ac.track:
         last = ac.track[-1]
         ac.lat, ac.lon, ac.alt_ft = last.lat, last.lon, last.alt_ft

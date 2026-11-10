@@ -149,7 +149,7 @@ EMERGENCY_ACARS_CATEGORIES = {"hijack", "bomb", "emergency", "fire", "downed"}
 
 
 def is_emergency(alert) -> bool:
-    if getattr(alert, "ground_test", False):
+    if getattr(alert, "ground_test", False) or not getattr(alert, "confirmed", True):
         return False
     for f in alert.flags:
         if f.origin == "squawk" and f.category in EMERGENCY_SQUAWK_CATEGORIES:

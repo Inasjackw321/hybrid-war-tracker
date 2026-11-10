@@ -55,6 +55,7 @@ def parse_aircraft(d: dict, now_s: float, source: str = "") -> Aircraft:
     alt = d.get("alt_baro")
     on_ground = alt == "ground"
     seen = _float(d.get("seen_pos", pos.get("seen_pos")))
+    msg_age = _float(d.get("seen"))
     db_flags = _int(d.get("dbFlags")) or 0
     return Aircraft(
         hex=str(d.get("hex", "")).upper(),
@@ -75,6 +76,8 @@ def parse_aircraft(d: dict, now_s: float, source: str = "") -> Aircraft:
         military=bool(db_flags & 1),
         seen_ts=now_s - (seen or 0),
         source=source,
+        msg_age=msg_age,
+        pos_age=seen,
     )
 
 
@@ -109,17 +112,22 @@ class AdsbClient:
         return found
 
     def query(self, kind: str, arg: str = "") -> list[Aircraft]:
-        """Ask each source in turn; merge results by hex (first source wins, later ones fill gaps)."""
+        """Ask each source in turn and merge by hex. The freshest report wins (the feeds can lag each other by
+        a minute or more, and an old squawk is exactly what we must not show); older ones only fill gaps."""
         merged: dict[str, Aircraft] = {}
         for src in self.sources:
             if kind not in SOURCES[src]["paths"]:
                 continue  # this feed doesn't offer that kind of query
             try:
                 for ac in self._get(src, kind, arg):
-                    if ac.hex not in merged:
+                    old = merged.get(ac.hex)
+                    if old is None:
+                        merged[ac.hex] = ac
+                    elif _fresher(ac, old):
+                        _fill(ac, old)
                         merged[ac.hex] = ac
                     else:
-                        _fill(merged[ac.hex], ac)
+                        _fill(old, ac)
             except http.FetchError as e:
                 self.errors.append(f"{src} {kind} {arg}: {e}")
         return list(merged.values())
@@ -135,10 +143,19 @@ class AdsbClient:
                 return found[0]
         return None
 
+    MAX_MSG_AGE_S = 60  # ignore aircraft the feeds haven't heard from for this long
+
     def squawks(self, codes) -> list[Aircraft]:
+        """Aircraft squawking these codes right now. A feed's /sqk list can include an aircraft that changed code
+        a moment ago, or one it hasn't heard from in a while, so each result is checked against the freshest
+        report from all the feeds."""
         out: dict[str, Aircraft] = {}
         for code in codes:
             for ac in self.query("sqk", code):
+                if ac.squawk != code:
+                    continue  # the freshest feed already has a different code
+                if ac.msg_age is not None and ac.msg_age > self.MAX_MSG_AGE_S:
+                    continue
                 out.setdefault(ac.hex, ac)
         return list(out.values())
 
@@ -194,8 +211,17 @@ class AdsbClient:
         return parse_route(res)
 
 
+def _fresher(a: Aircraft, b: Aircraft) -> bool:
+    """Is report a newer than report b? (by time since the last message, then since the last position)"""
+    def age(x):
+        return x.msg_age if x.msg_age is not None else (x.pos_age if x.pos_age is not None else 1e9)
+
+    return age(a) < age(b)
+
+
 def _fill(a: Aircraft, b: Aircraft):
-    for f in ("callsign", "registration", "type_code", "description", "operator", "emergency"):
+    # never copy squawk or emergency status from an older report: those must come from the freshest one
+    for f in ("callsign", "registration", "type_code", "description", "operator"):
         if not getattr(a, f) and getattr(b, f):
             setattr(a, f, getattr(b, f))
     if a.lat is None and b.lat is not None:
@@ -209,7 +235,8 @@ def parse_trace_all(data: dict) -> list[TrackPoint]:
         if len(row) < 4 or row[1] is None or row[2] is None:
             continue
         alt = row[3]
-        out.append(TrackPoint(base + float(row[0]), float(row[1]), float(row[2]), 0 if alt == "ground" else _int(alt)))
+        out.append(TrackPoint(base + float(row[0]), float(row[1]), float(row[2]), 0 if alt == "ground" else _int(alt),
+                              _float(row[4]) if len(row) > 4 else None))
     return out
 
 
@@ -227,7 +254,7 @@ def parse_trace(data: dict, hours: float = 8.0) -> list[TrackPoint]:
         # new leg: flagged by readsb (bit 2) or a long gap
         if pts and ((flags or 0) & 2 or ts - pts[-1].ts > 30 * 60):
             pts = []
-        pts.append(TrackPoint(ts, float(row[1]), float(row[2]), alt_ft))
+        pts.append(TrackPoint(ts, float(row[1]), float(row[2]), alt_ft, _float(row[4]) if len(row) > 4 else None))
     if pts:
         cutoff = pts[-1].ts - hours * 3600
         pts = [p for p in pts if p.ts >= cutoff]

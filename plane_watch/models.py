@@ -12,6 +12,7 @@ class TrackPoint:
     lat: float
     lon: float
     alt_ft: int | None = None  # None = unknown, 0 = on the ground
+    gs: float | None = None  # ground speed in knots, if known
 
 
 @dataclass
@@ -34,6 +35,8 @@ class Aircraft:
     military: bool = False
     seen_ts: float | None = None
     source: str = ""
+    msg_age: float | None = None  # seconds since the feed last heard from it at all
+    pos_age: float | None = None  # seconds since its last position
     track: list[TrackPoint] = field(default_factory=list)
 
     @property
@@ -76,6 +79,8 @@ class Alert:
     photo: dict | None = None  # {"url", "photographer", "link", "same_type"}
     card: str = ""  # path of the rendered PNG, relative to the output dir
     ground_test: bool = False  # squawking on the ground without having been airborne: probably a test
+    confirmed: bool = True  # False = shown, but kept off the counters, map and notifications until it's corroborated
+    note: str = ""  # why it isn't confirmed (or other caveats), shown on the dashboard
 
     @property
     def id(self) -> str:
@@ -107,4 +112,6 @@ class Alert:
             "track_points": len(self.aircraft.track),
             "card": self.card,
             "ground_test": self.ground_test,
+            "confirmed": self.confirmed,
+            "note": self.note,
         }
