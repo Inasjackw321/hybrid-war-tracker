@@ -121,3 +121,11 @@ def inv_merc_y(y: float) -> float:
 
 def project(lon: float, lat: float) -> tuple[float, float]:
     return math.radians(lon), merc_y(lat)
+
+
+def destination(lat: float, lon: float, bearing_deg: float, km: float) -> tuple[float, float]:
+    """The point `km` away along a bearing (great circle). Returns (lat, lon)."""
+    d, b, p1, l1 = km / 6371.0, math.radians(bearing_deg), math.radians(lat), math.radians(lon)
+    p2 = math.asin(math.sin(p1) * math.cos(d) + math.cos(p1) * math.sin(d) * math.cos(b))
+    l2 = l1 + math.atan2(math.sin(b) * math.sin(d) * math.cos(p1), math.cos(d) - math.sin(p1) * math.sin(p2))
+    return math.degrees(p2), (math.degrees(l2) + 540) % 360 - 180

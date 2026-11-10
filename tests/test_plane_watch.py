@@ -748,3 +748,106 @@ class FilterTests(unittest.TestCase):
             lp = app.last_positions(["P8", "C17"], 24)
             self.assertEqual(sorted(i["type"] for i in lp["items"]), ["C17", "P8"])
             self.assertTrue((Path(d) / lp["map"]).exists())
+
+
+class InferenceTests(unittest.TestCase):
+    def setUp(self):
+        self.dover = geo.airport("KDOV")
+
+    def test_low_approach_then_signal_lost_is_a_landing(self):
+        from plane_watch import tracker
+
+        d = self.dover
+        approach = [(i * 120, d["lat"] - 1.0 + 0.75 * i / 9, d["lon"] - 1.0 + 0.75 * i / 9, int(20000 - 16000 * i / 9)) for i in range(10)]
+        end = tracker.infer_end(approach, "end")
+        self.assertEqual((end["icao"], end["how"]), ("KDOV", "inferred"))
+        self.assertGreater(end["km"], 20)  # signal was lost well short of the field
+
+    def test_first_seen_climbing_out_is_a_takeoff(self):
+        from plane_watch import tracker
+
+        d = self.dover
+        climb = [(i * 120, d["lat"] + 0.05 + 0.1 * i, d["lon"] + 0.05 + 0.1 * i, 1500 + 2500 * i) for i in range(8)]
+        self.assertEqual(tracker.infer_end(climb, "start")["icao"], "KDOV")
+        self.assertIsNone(tracker.infer_end(climb, "end"))  # still climbing at 19,000 ft: not a landing
+
+    def test_overflights_and_ground_points(self):
+        from plane_watch import tracker
+
+        d = self.dover
+        over = [(i * 120, d["lat"] - 0.5 + 0.1 * i, d["lon"], 35000) for i in range(8)]
+        self.assertIsNone(tracker.infer_end(over, "end"))
+        self.assertIsNone(tracker.infer_end(over, "start"))
+        ground = [(0, d["lat"], d["lon"], 0), (120, d["lat"] + 0.05, d["lon"], 2000)]
+        self.assertEqual(tracker.infer_end(ground, "start")["how"], "ground")
+
+    def test_private_strips_dont_beat_real_bases(self):
+        from plane_watch import tracker
+
+        self.assertTrue(tracker._is_major(self.dover))
+        self.assertFalse(tracker._is_major({"name": "G W Farm Airport", "iata": ""}))
+
+    def test_orbit_is_detected(self):
+        from plane_watch import tracker
+
+        orbit = [(i * 120, 40 + 0.4 * math.sin(i / 4), -100 + 0.6 * math.cos(i / 4), 26000) for i in range(60)]
+        lo = tracker.loiter(orbit)
+        self.assertGreater(lo["minutes"], 90)
+        self.assertAlmostEqual(lo["lat"], 40, delta=0.3)
+        self.assertIsNone(tracker.loiter([(i * 120, 40 + 0.1 * i, -100, 30000) for i in range(60)]))
+
+
+class AnalysisTests(unittest.TestCase):
+    def test_summary_has_routes_kinds_hourly_and_insights(self):
+        from plane_watch import render, tracker
+
+        dover, ramstein = geo.airport("KDOV"), geo.airport("ETAR")
+        with tempfile.TemporaryDirectory() as d:
+            store = tracker.Store(Path(d) / "t.sqlite")
+            now = time.time()
+            for k, hex_ in enumerate(("AE0001", "AE0002")):  # two C-17s Dover -> Ramstein; the second one's landing is inferred
+                for i in range(21):
+                    f = i / 20
+                    last = i == 20
+                    lat = dover["lat"] + (ramstein["lat"] - dover["lat"]) * (f if not (last and k) else 0.995)
+                    lon = dover["lon"] + (ramstein["lon"] - dover["lon"]) * (f if not (last and k) else 0.995)
+                    alt = 0 if i == 0 else (0 if last and not k else 3000 if last else 9000 if i == 19 else 31000)
+                    store.record([Aircraft(hex_, callsign=f"RCH{k}", type_code="C17", description="BOEING C-17A", military=True,
+                                           operator="United States Air Force", lat=lat, lon=lon, alt_ft=alt, on_ground=alt == 0,
+                                           seen_ts=now - 20000 + i * 600 + k * 300)], now)
+            s = tracker.summarize(store, now - 86400, now=now)
+            self.assertEqual(s["kinds"], {"transit": 2})
+            self.assertEqual(s["ends"], {"ground": 3, "inferred": 1, "unknown": 0})
+            self.assertEqual((s["routes"][0]["from"], s["routes"][0]["to"], s["routes"][0]["flights"]), ("KDOV", "ETAR", 2))
+            self.assertEqual(s["airfields"][0]["movements"], 2)
+            etar = next(a for a in s["airfields"] if a["icao"] == "ETAR")
+            self.assertEqual(etar["inferred"], 1)
+            self.assertEqual(s["types"][0]["flights"], 2)
+            self.assertGreater(s["types"][0]["hours"], 5)
+            self.assertEqual(s["aircraft"][0]["home"] in ("KDOV", "ETAR"), True)
+            self.assertEqual(sum(h["departures"] for h in s["hourly"]), 2)
+            self.assertIsNone(s["previous"])  # nothing recorded before this period, so no comparison
+            self.assertTrue(any("KDOV → ETAR" in i for i in s["insights"]))
+            self.assertTrue(any("1 inferred" in i for i in s["insights"]))
+            tracker.write_csvs(s, Path(d), "24h")
+            with (Path(d) / "military_flights_24h.csv").open() as fh:
+                rows = list(csv.DictReader(fh))
+            self.assertEqual(sorted(r["to_how"] for r in rows), ["ground", "inferred"])
+            self.assertTrue((Path(d) / "military_routes_24h.csv").exists())
+            render.render_brief(s, Path(d) / "brief.png", "last 24 hours")
+            self.assertGreater((Path(d) / "brief.png").stat().st_size, 20000)
+            store.db.close()
+
+    def test_airfield_report(self):
+        from plane_watch.app import LiveApp, parser
+
+        with tempfile.TemporaryDirectory() as d:
+            store, now = FilterTests._store(self, d)
+            store.db.close()
+            app = LiveApp(parser().parse_args(["--out", d, "--udp-port", "0", "--no-browser", "--backfill-hours", "0"]))
+            r = app.airfield_report("KDOV", "24h")
+            self.assertTrue(r["found"])
+            self.assertEqual(r["summary"]["movements"], 2)
+            self.assertEqual(r["links"][0]["icao"], "ETAR")
+            self.assertEqual(len(r["summary"]["by_hour"]), 24)
+            self.assertFalse(app.airfield_report("ZZZZ", "24h")["found"])

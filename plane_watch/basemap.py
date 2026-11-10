@@ -25,6 +25,7 @@ def _data(name: str) -> str:
 NE = "https://raw.githubusercontent.com/nvkelso/natural-earth-vector/v5.1.2/geojson"
 LAND_50M = f"{NE}/ne_50m_land.geojson"
 PLACES_50M = f"{NE}/ne_50m_populated_places_simple.geojson"
+BORDERS_50M = f"{NE}/ne_50m_admin_0_boundary_lines_land.geojson"
 
 
 def cache_dir() -> Path:
@@ -90,3 +91,23 @@ def cities() -> list[tuple[str, float, float, int]]:
             pass
     data = json.loads(_data("cities.json"))
     return [tuple(c) for c in data["cities"]]
+
+
+@lru_cache(maxsize=1)
+def borders() -> list[list[list[float]]]:
+    """Country border lines [[lon, lat], ...] (Natural Earth 1:50m). Empty if they can't be downloaded: the bundled
+    low-resolution land is drawn per country, so its borders show anyway."""
+    if os.environ.get("PLANE_WATCH_LOWRES"):
+        return []
+    try:
+        gj = _cached_json(BORDERS_50M, "ne_50m_admin_0_boundary_lines_land.geojson")
+    except (http.FetchError, OSError, ValueError):
+        return []
+    lines = []
+    for f in gj.get("features", []):
+        g = f.get("geometry") or {}
+        if g.get("type") == "LineString":
+            lines.append(g["coordinates"])
+        elif g.get("type") == "MultiLineString":
+            lines.extend(g["coordinates"])
+    return lines

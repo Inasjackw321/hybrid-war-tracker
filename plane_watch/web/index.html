@@ -137,6 +137,21 @@
   .secnav a:hover { background: rgba(255, 255, 255, .07); color: var(--text); }
   h2, .stats { scroll-margin-top: 130px; }
   .busy { color: var(--warn); }
+  .tag { display: inline-block; font-size: 10.5px; font-weight: 700; letter-spacing: .03em; padding: 1px 6px; border-radius: 999px;
+    background: rgba(255, 255, 255, .07); color: var(--muted); vertical-align: 1px; margin-left: 4px; }
+  .tag.inf { background: rgba(255, 214, 10, .14); color: #ffd60a; }
+  .tag.k-transit { background: rgba(100, 210, 255, .14); color: #64d2ff; } .tag.k-local { background: rgba(48, 209, 88, .14); color: #30d158; }
+  .tag.k-loiter { background: rgba(191, 90, 242, .16); color: #d08bff; }
+  .brief { display: grid; grid-template-columns: minmax(260px, 1fr) minmax(0, 1.6fr); gap: 16px; align-items: start; margin-bottom: 14px; }
+  @media (max-width: 900px) { .brief { grid-template-columns: 1fr; } }
+  .brief ul { margin: 6px 0 0; padding: 0; list-style: none; font-size: 14px; color: #cfd6dd; }
+  .brief li { padding: 5px 0 5px 16px; position: relative; }
+  .brief li::before { content: ""; position: absolute; left: 0; top: 13px; width: 6px; height: 6px; border-radius: 50%; background: #64d2ff; }
+  .brief img { width: 100%; border-radius: 14px; box-shadow: var(--shadow); cursor: zoom-in; display: block; }
+  .mix { display: flex; height: 8px; border-radius: 999px; overflow: hidden; margin: 10px 0 4px; background: rgba(255,255,255,.06); }
+  .mix span { display: block; height: 100%; }
+  .spark { display: flex; align-items: flex-end; gap: 2px; height: 54px; margin: 8px 0 2px; }
+  .spark i { flex: 1; background: linear-gradient(to top, #5a2a9c, #ff6a5a); border-radius: 2px 2px 0 0; min-height: 1px; opacity: .9; }
   .ctl.on-blue { background: rgba(142, 197, 255, .18); color: #8ec5ff; }
   .tight td, .tight th { padding: 6px 8px; }
   footer { color: var(--faint); font-size: 12.5px; padding: 40px 0 30px; }
@@ -194,12 +209,21 @@
     <button class="btn ghost" id="f-clear">Clear</button>
   </div>
   <p class="meta" id="filter-status"></p>
+  <div class="brief">
+    <div class="panel">
+      <div class="k">Analyst brief</div>
+      <ul id="insights"><li>The first analysis appears a minute or two after Plane Watch starts.</li></ul>
+      <div class="mix" id="mix"></div>
+      <div class="meta" id="mix-legend"></div>
+    </div>
+    <img id="brief-img" alt="Military brief: key numbers, activity by hour, busiest airfields, types and routes" style="display:none" onload="this.style.display='block'" onerror="this.style.display='none'">
+  </div>
   <div class="overview"><img id="heat" alt="Heatmap of military aircraft paths" style="display:none" onload="this.style.display='block'" onerror="this.style.display='none'"></div>
   <p class="meta" id="heat-meta">Built from what Plane Watch records while it's running. Leave it on to fill in the week.</p>
   <p class="meta" id="backfill-meta"></p>
 
   <div class="sub-h">Where they go</div>
-  <div class="seg" id="where-tabs"><button data-t="flights">Flights</button><button data-t="airfields">Busiest airfields</button><button data-t="types">Types</button><button data-t="aircraft">Aircraft</button><button data-t="operators">Operators</button></div>
+  <div class="seg" id="where-tabs"><button data-t="flights">Flights</button><button data-t="airfields">Airfields</button><button data-t="routes">Routes</button><button data-t="loiters">Orbits &amp; holds</button><button data-t="types">Types</button><button data-t="aircraft">Aircraft</button><button data-t="operators">Operators</button><button data-t="new_aircraft">New today</button></div>
   <div class="panel">
     <input class="search" id="where-search" placeholder="Search this table…" aria-label="Search table">
     <span class="meta" id="where-downloads"></span>
@@ -375,17 +399,32 @@ function render7700() {
 }
 
 const fmtT = ts => ts ? new Date(ts * 1000).toISOString().slice(5, 16).replace("T", " ") : "";
-const ap = a => a ? `<strong>${esc(a.icao)}</strong> <span class="meta">${esc(a.name)}</span>` : `<span class="meta">en route</span>`;
+const ap = a => a ? `<strong>${esc(a.icao)}</strong> <span class="meta">${esc(a.name)}</span>${a.how === "inferred" ? `<span class="tag inf" title="Signal ${a.km} km from the field at ${(a.alt ?? 0).toLocaleString()} ft: inferred from a low approach or climb-out">inferred</span>` : ""}`
+  : `<span class="meta">en route</span>`;
+const kindTag = f => `<span class="tag k-${esc(f.kind)}">${esc(f.kind)}</span>${f.loiter ? `<span class="tag k-loiter" title="Orbited or held for ${f.loiter.minutes} min">orbit ${f.loiter.minutes}m</span>` : ""}`;
 const WHERE = {
-  flights: {head: ["Start (UTC)", "End", "Aircraft", "Type", "From", "To", "Min", "km", "Max alt"],
+  flights: {head: ["Start (UTC)", "End", "Aircraft", "Type", "Kind", "From", "To", "Min", "km", "Max alt"],
     row: f => [fmtT(f.start_ts), fmtT(f.end_ts).slice(6), `<strong>${esc(f.callsign || f.reg || f.hex)}</strong> <span class="meta">${esc(f.hex)}</span>`,
-      esc(f.type), ap(f.from), ap(f.to), f.minutes, f.km.toLocaleString(), (f.max_alt || 0).toLocaleString()], num: [6, 7, 8]},
-  airfields: {head: ["Airfield", "Country", "Movements", "Departures", "Arrivals", "Aircraft", "Main types"],
-    row: a => [`<strong>${esc(a.icao)}</strong> ${esc(a.name)}`, esc(a.country), a.movements, a.departures, a.arrivals, a.unique_aircraft, esc(a.top_types)], num: [2, 3, 4, 5]},
-  types: {head: ["Type", "Description", "Aircraft seen"], row: t => [`<strong>${esc(t.type)}</strong>`, esc(t.descr), t.aircraft], num: [2]},
-  aircraft: {head: ["Aircraft", "Reg", "Type", "Operator", "Flights", "km", "Airfields"],
-    row: a => [`<strong>${esc(a.callsign || a.hex)}</strong> <span class="meta">${esc(a.hex)}</span>`, esc(a.reg), esc(a.type), esc(a.operator), a.flights, a.km.toLocaleString(), esc(a.airfields)], num: [4, 5]},
+      esc(f.type), kindTag(f), ap(f.from), ap(f.to), f.minutes, f.km.toLocaleString(), (f.max_alt || 0).toLocaleString()], num: [7, 8, 9]},
+  airfields: {head: ["Airfield", "Country", "Movements", "Out", "In", "Inferred", "Aircraft", "Peak (UTC)", "Main types", "Linked to"], click: "icao",
+    row: a => [`<strong>${esc(a.icao)}</strong> ${esc(a.name)}`, esc(a.country), a.movements, a.departures, a.arrivals, a.inferred ?? "", a.unique_aircraft,
+      a.peak_hour != null ? String(a.peak_hour).padStart(2, "0") + ":00" : "", esc(a.top_types), esc(a.top_links || "")], num: [2, 3, 4, 5, 6]},
+  routes: {head: ["From", "To", "Flights", "Aircraft", "Distance km", "Avg min", "Types"],
+    row: r => [`<strong>${esc(r.from)}</strong> <span class="meta">${esc(r.from_name)}</span>`, `<strong>${esc(r.to)}</strong> <span class="meta">${esc(r.to_name)}</span>`,
+      r.flights, r.aircraft, r.km.toLocaleString(), r.avg_minutes, esc(r.types)], num: [2, 3, 4, 5]},
+  loiters: {head: ["Start (UTC)", "Aircraft", "Type", "Operator", "Minutes", "Altitude", "Centre", "Near", "From → To"],
+    row: l => [fmtT(l.start_ts), `<strong>${esc(l.callsign || l.hex)}</strong> <span class="meta">${esc(l.hex)}</span>`, esc(l.type), esc(l.operator), l.minutes,
+      (l.alt || 0).toLocaleString() + " ft", `<span class="meta">${l.lat}, ${l.lon}</span>`, l.near ? `${esc(l.near.icao)} <span class="meta">${l.near.km} km</span>` : "",
+      `${l.from ? esc(l.from.icao) : "?"} → ${l.to ? esc(l.to.icao) : "?"}`], num: [4]},
+  types: {head: ["Type", "Description", "Aircraft", "Flights", "Hours", "Avg min", "Avg km", "Max alt", "Orbit min", "Main airfields"],
+    row: t => [`<strong>${esc(t.type)}</strong>`, esc(t.descr), t.aircraft, t.flights ?? 0, t.hours ?? 0, t.avg_minutes ?? 0, (t.avg_km ?? 0).toLocaleString(),
+      (t.max_alt ?? 0).toLocaleString(), t.loiter_minutes ?? 0, esc(t.top_airfields || "")], num: [2, 3, 4, 5, 6, 7, 8]},
+  aircraft: {head: ["Aircraft", "Reg", "Type", "Operator", "Flights", "Hours", "km", "Home", "Last at", "Airfields"],
+    row: a => [`<strong>${esc(a.callsign || a.hex)}</strong> <span class="meta">${esc(a.hex)}</span>`, esc(a.reg), esc(a.type), esc(a.operator), a.flights, a.hours ?? "",
+      a.km.toLocaleString(), `<strong>${esc(a.home || "")}</strong>`, esc(a.last_airfield || ""), esc(a.airfields)], num: [4, 5, 6]},
   operators: {head: ["Operator", "Aircraft seen"], row: o => [esc(o.operator), o.aircraft], num: [1]},
+  new_aircraft: {head: ["First seen (UTC)", "Aircraft", "Type", "Description", "Operator"],
+    row: n => [fmtT(n.first_seen), `<strong>${esc(n.callsign || n.hex)}</strong> <span class="meta">${esc(n.hex)}</span>`, esc(n.type), esc(n.descr), esc(n.operator)], num: []},
 };
 
 const F = {period: "24h", type: "", operator: "", airfield: "", text: ""};
@@ -403,7 +442,8 @@ function fillSelect(id, rows, label, valKey, textFn) {
 async function loadMilitary() {
   if (!mil) { renderMilitary(); return; }
   if (!filtersOn()) {
-    cur = {...(mil.periods[F.period] || {}), heatmap: `cards/military-heatmap-${F.period}.png`, updated_ts: mil.updated_ts, filter: ""};
+    cur = {...(mil.periods[F.period] || {}), heatmap: `cards/military-heatmap-${F.period}.png`, brief: `cards/brief-${F.period}.png`,
+           updated_ts: mil.updated_ts, filter: ""};
     renderMilitary(); return;
   }
   const key = filterQuery() + "|" + mil.updated_ts;
@@ -431,17 +471,25 @@ function renderMilitary() {
   if (P.heatmap) $("heat").src = `${P.heatmap}?v=${Math.round(P.updated_ts || 0)}`;
   $("heat-meta").textContent = `${(P.positions || 0).toLocaleString()} positions from ${(P.aircraft_seen || 0).toLocaleString()} military aircraft, ${(P.flight_count || 0).toLocaleString()} flights. `
     + `Recording since ${(mil.recording_since || "").replace("T", " ").slice(0, 16)} UTC; positions are kept ${mil.record_days} days. Updated ${fmtT(P.updated_ts || mil.updated_ts)} UTC.`;
+  if (P.brief) { $("brief-img").src = `${P.brief}?v=${Math.round(P.updated_ts || 0)}`; $("brief-img").dataset.full = $("brief-img").src; }
+  $("insights").innerHTML = (P.insights || []).map(i => `<li>${esc(i)}</li>`).join("") || "<li>Nothing recorded for this period yet.</li>";
+  const K = P.kinds || {}, KC = {transit: "#64d2ff", local: "#30d158", partial: "#8e98a4", "en route": "#4a525c"}, total = Object.values(K).reduce((a, b) => a + b, 0);
+  $("mix").innerHTML = total ? Object.keys(KC).filter(k => K[k]).map(k => `<span style="width:${K[k] / total * 100}%;background:${KC[k]}" title="${k}: ${K[k]}"></span>`).join("") : "";
+  $("mix-legend").innerHTML = total ? Object.keys(KC).filter(k => K[k]).map(k => `<span style="color:${KC[k]}">●</span> ${k} ${K[k]}`).join(" &nbsp; ")
+    + (P.ends ? ` &nbsp;·&nbsp; ends: ${P.ends.ground} confirmed, ${P.ends.inferred} inferred, ${P.ends.unknown} unknown` : "") : "";
   const def = WHERE[whereTab], q = $("where-search").value.toLowerCase();
   const data = (P[whereTab] || []).filter(r => !q || JSON.stringify(r).toLowerCase().includes(q)).slice(0, 400);
   $("where-table").innerHTML = `<thead><tr>${def.head.map((h, i) => `<th class="${def.num.includes(i) ? "num" : ""}">${h}</th>`).join("")}</tr></thead><tbody>`
-    + (data.map(r => `<tr${r.hex ? ` class="click" data-hex="${esc(r.hex)}" title="Show this aircraft's flights"` : ""}>${def.row(r).map((c, i) => `<td class="${def.num.includes(i) ? "num" : ""}">${c}</td>`).join("")}</tr>`).join("")
+    + (data.map(r => `<tr${r.hex ? ` class="click" data-hex="${esc(r.hex)}" title="Show this aircraft's flights"` : def.click === "icao" ? ` class="click" data-icao="${esc(r.icao)}" title="Show this airfield in depth"` : ""}>${def.row(r).map((c, i) => `<td class="${def.num.includes(i) ? "num" : ""}">${c}</td>`).join("")}</tr>`).join("")
        || `<tr><td colspan="${def.head.length}" class="meta">Nothing recorded for this filter and period yet.</td></tr>`) + "</tbody>";
   document.querySelectorAll("#where-table tr[data-hex]").forEach(tr => tr.onclick = () => lookup(tr.dataset.hex));
-  const csv = {flights: "flights", airfields: "airfields", aircraft: "aircraft"}[whereTab];
+  document.querySelectorAll("#where-table tr[data-icao]").forEach(tr => tr.onclick = () => airfield(tr.dataset.icao));
+  const csv = {flights: "flights", airfields: "airfields", aircraft: "aircraft", routes: "routes", types: "types", loiters: "loiters"}[whereTab];
   $("where-downloads").innerHTML = !csv ? "" : filtersOn()
     ? `Download: <a href="api/military?${filterQuery()}&csv=${csv}">${csv} (filtered, CSV)</a>`
     : F.period === "3d" ? "" : `Download: <a href="data/military_${csv}_${F.period}.csv">military_${csv}_${F.period}.csv</a>`;
   renderTypes();
+  bindImages();
 }
 
 // ---- type tracker
@@ -550,6 +598,39 @@ async function lookup(hex) {
   const b = $("drawer-watch"); if (b) b.onclick = async () => { const x = await post("watch", {query: "hex:" + hex}); b.outerHTML = `<span class="meta">${esc(x.message)}</span>`; setTimeout(poll, 1500); };
 }
 
+async function airfield(icao) {
+  const d = $("drawer"); d.classList.add("open");
+  const close = `<button class="x" style="top:16px;right:16px" onclick="document.getElementById('drawer').classList.remove('open')">×</button>`;
+  d.innerHTML = close + `<p class="meta">Loading ${esc(icao)}…</p>`;
+  const period = F.period;
+  let r; try { r = await (await fetch(`api/airfield?icao=${encodeURIComponent(icao)}&period=${period}`)).json(); } catch { r = {found: false}; }
+  if (!r.found) { d.innerHTML = close + `<div class="ident" style="font-size:24px;font-weight:700">${esc(icao)}</div><p class="meta">No movements recorded here in this period.</p>`; return; }
+  const a = r.summary, peak = Math.max(...a.by_hour, 1);
+  d.innerHTML = close + `<div class="ident" style="font-size:24px;font-weight:700;margin-top:4px">${esc(icao)}</div>
+    <div class="meta">${esc([r.name, r.city, r.country].filter(Boolean).join(" · "))} · ${esc(r.label)}</div>
+    <div class="stats" style="margin:14px 0">
+      <div class="stat"><div class="n">${a.movements}</div><div class="l">movements</div></div>
+      <div class="stat"><div class="n">${a.departures} / ${a.arrivals}</div><div class="l">out / in</div></div>
+      <div class="stat"><div class="n">${a.unique_aircraft}</div><div class="l">aircraft</div></div></div>
+    <p class="meta">${a.inferred} of these movements are inferred from a low approach or climb-out; the rest were seen on the ground. ${r.local} local flights (out and back).</p>
+    <div class="k">Movements by hour of day (UTC)</div>
+    <div class="spark">${a.by_hour.map((n, h) => `<i style="height:${n / peak * 100}%" title="${String(h).padStart(2, "0")}:00 — ${n}"></i>`).join("")}</div>
+    <div class="meta" style="display:flex;justify-content:space-between"><span>00</span><span>06</span><span>12</span><span>18</span><span>23</span></div>
+    <div class="k" style="margin-top:16px">Linked airfields</div>
+    <div class="scroll"><table class="tight"><tbody>${r.links.map(l => `<tr class="click" data-icao="${esc(l.icao)}"><td><strong>${esc(l.icao)}</strong> <span class="meta">${esc(l.name)}</span></td><td class="num">${l.to} out</td><td class="num">${l.from} in</td></tr>`).join("") || `<tr><td class="meta">None seen.</td></tr>`}</tbody></table></div>
+    <div class="k" style="margin-top:16px">What flies here</div>
+    <div class="scroll"><table class="tight"><tbody>${r.types.map(t => `<tr><td><strong>${esc(t.type)}</strong> <span class="meta">${esc(t.descr)}</span></td><td class="num">${t.flights} flight${t.flights === 1 ? "" : "s"}</td><td class="num">${t.hours} h</td></tr>`).join("")}</tbody></table></div>
+    <div class="k" style="margin-top:16px">Aircraft that use it most (likely based here)</div>
+    <div class="scroll"><table class="tight"><tbody>${r.based.map(b => `<tr class="click" data-hex="${esc(b.hex)}"><td><strong>${esc(b.callsign || b.hex)}</strong> <span class="meta">${esc(b.hex)}</span></td><td>${esc(b.type)}</td><td class="num">${b.flights} flights</td></tr>`).join("") || `<tr><td class="meta">None yet: an aircraft counts once it has used this airfield more than any other, at least twice.</td></tr>`}</tbody></table></div>
+    <div class="k" style="margin-top:16px">Recent flights</div>
+    <div class="scroll"><table class="tight"><thead><tr><th>Start (UTC)</th><th>Aircraft</th><th>From</th><th>To</th></tr></thead><tbody>
+    ${r.flights.slice(0, 60).map(f => `<tr class="click" data-hex="${esc(f.hex)}"><td>${fmtT(f.start_ts)}</td><td><strong>${esc(f.callsign || f.hex)}</strong> <span class="meta">${esc(f.type)}</span></td><td>${ap(f.from)}</td><td>${ap(f.to)}</td></tr>`).join("")}</tbody></table></div>
+    <p><button class="btn ghost" id="af-filter">Filter the heatmap and tables to ${esc(icao)}</button></p>`;
+  d.querySelectorAll("tr[data-icao]").forEach(tr => tr.onclick = () => airfield(tr.dataset.icao));
+  d.querySelectorAll("tr[data-hex]").forEach(tr => tr.onclick = () => lookup(tr.dataset.hex));
+  $("af-filter").onclick = () => { F.airfield = icao; $("f-airfield").value = icao; d.classList.remove("open"); loadMilitary(); location.hash = "sec-military"; };
+}
+
 // ---- desktop notifications
 let notifyOn = false; try { notifyOn = localStorage.getItem("pw-notify") === "1" && Notification.permission === "granted"; } catch {}
 let seenAlerts = null, seenWatch = null;
@@ -596,7 +677,7 @@ function renderHistory() {
 }
 
 function bindImages() {
-  document.querySelectorAll("img[data-full], #overview").forEach(img => img.onclick = () => {
+  document.querySelectorAll("img[data-full], #overview, #heat, #watched, #brief-img").forEach(img => img.onclick = () => {
     const lb = $("lightbox"); lb.querySelector("img").src = img.dataset.full || img.src; lb.classList.add("open");
   });
 }

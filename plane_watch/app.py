@@ -181,9 +181,20 @@ class QuietHandler(SimpleHTTPRequestHandler):
             except Exception as e:  # noqa: BLE001
                 return self._json(500, {"error": str(e)})
             table = (q.get("csv") or [""])[0]
-            if table in ("flights", "airfields", "aircraft"):
+            if table in ("flights", "airfields", "aircraft", "routes", "types", "loiters"):
                 return self._csv(data, table)
             return self._json(200, {k: v for k, v in data.items() if k != "flights_all"})
+        if self.path.startswith("/api/airfield") and self.app is not None:
+            from urllib.parse import parse_qs, urlsplit
+
+            q = parse_qs(urlsplit(self.path).query)
+            icao = (q.get("icao") or [""])[0].strip().upper()
+            if not icao:
+                return self._json(400, {"error": "icao missing"})
+            try:
+                return self._json(200, self.app.airfield_report(icao, (q.get("period") or ["7d"])[0]))
+            except Exception as e:  # noqa: BLE001
+                return self._json(500, {"error": str(e)})
         if self.path.startswith("/api/lastpos") and self.app is not None:
             from urllib.parse import parse_qs, urlsplit
 
@@ -209,7 +220,7 @@ class QuietHandler(SimpleHTTPRequestHandler):
         return super().do_GET()
 
     def _csv(self, data: dict, table: str):
-        summary = {"flights": data.get("flights_all", data["flights"]), "airfields": data["airfields"], "aircraft": data["aircraft"]}
+        summary = {**data, "flights": data.get("flights_all", data["flights"])}
         with tempfile_dir() as d:
             tracker.write_csvs(summary, d, "x")
             body = (d / f"military_{table}_x.csv").read_bytes()
@@ -251,6 +262,18 @@ def tempfile_dir():
 
 
 PERIODS = {"24h": ("last 24 hours", 24), "3d": ("last 3 days", 72), "7d": ("last 7 days", 168)}
+
+
+def trim_summary(summ: dict) -> dict:
+    """The parts of a tracker.summarize() result the dashboard shows (capped so the JSON stays small)."""
+    return {
+        "positions": summ["positions"], "aircraft_seen": summ["aircraft_seen"], "flight_count": len(summ["flights"]),
+        "flight_hours": summ["flight_hours"], "flights": summ["flights"][:400], "airfields": summ["airfields"][:150],
+        "routes": summ["routes"][:150], "loiters": summ["loiters"][:100], "types": summ["types"][:80],
+        "operators": summ["operators"][:40], "aircraft": summ["aircraft"][:300], "kinds": summ["kinds"], "ends": summ["ends"],
+        "hourly": summ["hourly"], "previous": summ["previous"], "insights": summ["insights"],
+        "new_aircraft": summ["new_aircraft"][:60],
+    }
 
 
 def start_server(directory: Path, port: int, app=None) -> int:
@@ -494,11 +517,9 @@ class LiveApp:
             render.render_heatmap(self.store.points(now - hours * 3600), self.out / "cards" / f"military-heatmap-{key}.png",
                                   summ, label, title=self.args.title, brand=self.args.brand,
                                   segments=self.store.segment_chunks(now - hours * 3600))
-            out["periods"][key] = {
-                "label": label, "positions": summ["positions"], "aircraft_seen": summ["aircraft_seen"], "flight_count": len(summ["flights"]),
-                "flights": summ["flights"][:400], "airfields": summ["airfields"][:150], "types": summ["types"][:60],
-                "operators": summ["operators"][:40], "aircraft": summ["aircraft"][:300],
-            }
+            out["periods"][key] = {"label": label, **trim_summary(summ)}
+            self.progress(f"Drawing the brief ({label})")
+            render.render_brief(summ, self.out / "cards" / f"brief-{key}.png", label, title=self.args.title, brand=self.args.brand)
         self.progress("Drawing the Osprey / H-60 map")
         watched = self.store.watched(now - 24 * 3600, self.watch_types)
         render.render_watched(watched, self.out / "cards" / "watched-24h.png", now=now, title=self.args.title, brand=self.args.brand,
@@ -539,18 +560,47 @@ class LiveApp:
             render.render_heatmap(store.points(now - hours * 3600, filt=filt, hexes=summ["hexes"]), self.out / name, summ, label,
                                   title=self.args.title, brand=self.args.brand, filter_label=fl_label,
                                   segments=store.segment_chunks(now - hours * 3600, filt=filt, hexes=summ["hexes"]))
+            brief = f"cards/brief-{hashlib.sha1(key.encode()).hexdigest()[:10]}.png"
+            render.render_brief(summ, self.out / brief, label, title=self.args.title, brand=self.args.brand, filter_label=fl_label)
         finally:
             store.db.close()
-        data = {
-            "period": period, "label": label, "filter": fl_label, "heatmap": name, "updated_ts": now,
-            "positions": summ["positions"], "aircraft_seen": summ["aircraft_seen"], "flight_count": len(summ["flights"]),
-            "flights": summ["flights"][:400], "flights_all": summ["flights"], "airfields": summ["airfields"][:150],
-            "types": summ["types"][:60], "operators": summ["operators"][:40], "aircraft": summ["aircraft"][:300],
-        }
+        data = {"period": period, "label": label, "filter": fl_label, "heatmap": name, "brief": brief, "updated_ts": now,
+                **trim_summary(summ), "flights_all": summ["flights"]}
         cache[key] = {"ts": now, "data": data}
         for k in sorted(cache, key=lambda k: cache[k]["ts"])[:-20]:  # keep the 20 most recent filters
             del cache[k]
         return data
+
+    def airfield_report(self, icao: str, period: str) -> dict:
+        """One airfield in depth: movements, when it's busy, what flies there, where from/to, which aircraft live there."""
+        from . import geo
+
+        period = period if period in PERIODS else "7d"
+        label, hours = PERIODS[period]
+        now = time.time()
+        store = tracker.Store(self.out / "data" / "tracks.sqlite")
+        try:
+            summ = tracker.summarize(store, now - hours * 3600, tracker.Filter(airfield=icao), now)
+        finally:
+            store.db.close()
+        row = next((a for a in summ["airfields"] if a["icao"] == icao), None)
+        fl = [f for f in summ["flights"] if (f["from"] or {}).get("icao") == icao or (f["to"] or {}).get("icao") == icao]
+        links: dict[str, dict] = {}
+        for f in fl:
+            for mine, other, kind in (("from", "to", "to"), ("to", "from", "from")):
+                o = f[other]
+                if (f[mine] or {}).get("icao") == icao and o and o["icao"] != icao:
+                    r = links.setdefault(o["icao"], {"icao": o["icao"], "name": o["name"], "to": 0, "from": 0})
+                    r[kind] += 1
+        based = [a for a in summ["aircraft"] if a.get("home") == icao and a["flights"] >= 2]  # one visit isn't a home
+        ap = geo.airport(icao) or {}
+        return {
+            "icao": icao, "name": ap.get("name", ""), "city": ap.get("city", ""), "country": ap.get("country", ""), "period": period,
+            "label": label, "found": row is not None, "summary": row, "flights": fl[:200],
+            "links": sorted(links.values(), key=lambda r: -(r["to"] + r["from"]))[:30],
+            "types": [t for t in summ["types"] if t["flights"]][:20], "based": based[:60],
+            "local": sum(1 for f in fl if f["kind"] == "local"), "insights": summ["insights"][:1],
+        }
 
     def last_positions(self, types: list[str], hours: float) -> dict:
         """Last position of every aircraft of these types in the last `hours`, with a map."""

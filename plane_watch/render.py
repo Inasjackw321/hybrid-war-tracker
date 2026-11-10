@@ -304,7 +304,21 @@ class MapFrame:
             return out
 
         lw = 0.45 * PT
-        self.ax.add_collection(PolyCollection(polys(outers), facecolors=C["land"], edgecolors=C["coast"], linewidths=lw, zorder=1))
+        land_polys = polys(outers)
+        # a soft glow along the coast: wide, faint lines drawn under the land so only the sea side shows
+        for width, alpha in ((7.0, 0.035), (3.6, 0.055), (1.6, 0.09)):
+            self.ax.add_collection(PolyCollection(land_polys, facecolors="none", edgecolors="#7fa8d6", linewidths=width * PT,
+                                                  alpha=alpha, zorder=0.9, joinstyle="round"))
+        self.ax.add_collection(PolyCollection(land_polys, facecolors=C["land"], edgecolors=C["coast"], linewidths=lw, zorder=1))
+        segs = []
+        for line in basemap.borders():
+            lo = [p[0] for p in line]
+            la = [p[1] for p in line]
+            if max(la) < self.lat_lo or min(la) > self.lat_hi or max(lo) < self.lon_lo or min(lo) > self.lon_hi:
+                continue
+            segs.append([self.P(x, y) for x, y in line])
+        if segs:
+            self.ax.add_collection(LineCollection(segs, colors="#ffffff", alpha=0.07, linewidths=0.5 * PT, zorder=1.1))
         if holes:
             self.ax.add_collection(PolyCollection(polys(holes), facecolors=C["ocean"], edgecolors=C["coast"], linewidths=lw, zorder=1))
         # faint graticule, like an aviation chart
@@ -404,31 +418,78 @@ def _panel(card: Card, alert: Alert, photo_bytes: bytes | None):
     sub = " · ".join(s for s in (ac.operator, country, "Military" if ac.military else "") if s)
     card.text(x0, 117, textwrap.shorten(sub or "Operator unknown", 40, placeholder="…"), px=6.8, color=C["muted"])
 
-    _draw_photo(card, alert, x0 - 4, 125, xr - x0 + 8, 120, photo_bytes, cat["color"])
+    _draw_photo(card, alert, x0 - 4, 124, xr - x0 + 8, 96, photo_bytes, cat["color"])
     if alert.photo:
-        card.text(x0, 252, textwrap.shorten(f"Photo: {alert.photo.get('photographer') or 'unknown'} / planespotters.net", 46, placeholder="…"),
-                  px=5.6, color=C["muted"])
-        if alert.photo.get("same_type"):
-            card.text(x0, 261, "Same type — not this airframe", px=5.6, color="#e8c547")
-    _fade_rule(card, x0 - 4, xr + 4, 270)
+        credit = f"Photo: {alert.photo.get('photographer') or 'unknown'} / planespotters.net"
+        card.text(x0, 226, textwrap.shorten(credit, 46, placeholder="…"), px=5.2, color=C["faint"])
+
+    # the three numbers people look for first, as tiles
+    vr = ac.vrate_fpm
+    trend = "" if not vr or abs(vr) < 200 else (f"▲ {abs(vr):,} fpm" if vr > 0 else f"▼ {abs(vr):,} fpm")
+    tiles = [
+        ("ALTITUDE", "GND" if ac.on_ground else (f"{ac.alt_ft:,}" if ac.alt_ft is not None else "—"), "" if ac.on_ground else "ft", trend),
+        ("SPEED", f"{ac.speed_kt:.0f}" if ac.speed_kt is not None else "—", "kt", ""),
+        ("HEADING", f"{ac.heading:.0f}°" if ac.heading is not None else "—", "", ""),
+    ]
+    gap, tw = 5, (xr - x0 - 10) / 3
+    for k, (label, value, unit, note) in enumerate(tiles):
+        tx = x0 + k * (tw + gap)
+        card.ov.add_patch(FancyBboxPatch((tx, 234), tw, 36, boxstyle="round,pad=0,rounding_size=5", fc="#ffffff", alpha=0.045, ec="none", zorder=5))
+        card.text(tx + 6, 244, label, px=4.8, color=C["faint"], weight="bold")
+        v = card.text(tx + 6, 259, value, px=10.5, weight="bold")
+        if unit:
+            card.text(tx + 6 + card.measure(value, 10.5, "bold") + 2, 259, unit, px=5.6, color=C["muted"], weight="bold")
+        if note:
+            card.text(tx + 6, 267, note, px=4.6, color="#ff9f0a" if vr < 0 else "#30d158", weight="bold")
+        del v
+
+    _altitude_profile(card, ac, x0, 280, xr - x0, 44)
 
     sq = ac.squawk or "—"
     rows = [
-        ("ALTITUDE", "GROUND" if ac.on_ground else (f"{ac.alt_ft:,} ft" if ac.alt_ft is not None else "—"), None),
-        ("SPEED", f"{ac.speed_kt:.0f} kt" if ac.speed_kt is not None else "—", None),
-        ("HEADING", f"{ac.heading:.0f}°" if ac.heading is not None else "—", None),
         ("SQUAWK", sq, CATEGORIES[SQUAWKS[sq][0]]["color"] if sq in SQUAWKS else None),
         ("HEX", ac.hex, None),
         ("REG · TYPE", " · ".join(s for s in (ac.registration, ac.type_code) if s) or "—", None),
         ("TRACK START", _hhmm(ac.track[0].ts) if ac.track else "—", None),
         ("SEEN", _hhmm(ac.seen_ts), None),
     ]
-    card.text(x0, 280, "FLIGHT DATA", px=5.2, color=C["faint"], weight="bold")
-    y = 294
+    y = 346
     for label, value, color in rows:
-        card.text(x0, y, label, px=5.5, color=C["muted"])
-        card.text(xr, y, value, px=7.6, weight="bold", ha="right", color=color or C["text"])
-        y += 17
+        card.text(x0, y, label, px=5.4, color=C["muted"])
+        card.text(xr, y, value, px=7.4, weight="bold", ha="right", color=color or C["text"])
+        y += 16
+
+
+def _altitude_profile(card: Card, ac, x, y, w, h):
+    """A small chart of altitude over the flight, filled with the same colours as the track."""
+    card.text(x, y, "ALTITUDE PROFILE", px=4.8, color=C["faint"], weight="bold")
+    pts = [(p.ts, p.alt_ft or 0) for p in ac.track if p.alt_ft is not None]
+    top, base = y + 8, y + h
+    if len(pts) < 3 or pts[-1][0] - pts[0][0] < 120:
+        card.text(x, base - 6, "Not enough track yet", px=5.4, color=C["faint"])
+        return
+    t0, t1 = pts[0][0], pts[-1][0]
+    peak = max(max(a for _, a in pts), 2000)
+    n = 120
+    ts = np.linspace(t0, t1, n)
+    alts = np.interp(ts, [p[0] for p in pts], [p[1] for p in pts])
+    # image: each column coloured by its altitude, opaque below the line and fading towards the bottom
+    rows_ = 40
+    yy = np.linspace(1, 0, rows_)[:, None]  # 1 at the top of the chart
+    frac = (alts / peak)[None, :]
+    img = np.zeros((rows_, n, 4))
+    cols = ALT_CMAP([alt_frac(a) for a in alts])
+    img[..., :3] = cols[None, :, :3]
+    img[..., 3] = np.where(yy <= frac, 0.18 + 0.5 * (yy / np.maximum(frac, 1e-6)) ** 1.5, 0)
+    card.image(img, x, top, x + w, base, z=5)
+    xs = x + (ts - t0) / (t1 - t0) * w
+    ys = base - alts / peak * (base - top)
+    segs = [[(xs[k], ys[k]), (xs[k + 1], ys[k + 1])] for k in range(n - 1)]
+    card.ov.add_collection(LineCollection(segs, colors=cols[1:], linewidths=1.2 * PT, zorder=6, capstyle="round"))
+    card.ov.plot([xs[-1]], [ys[-1]], "o", ms=3 * PT, color="#ffffff", mew=0, zorder=7)
+    card.text(x + w, y, f"max {peak:,.0f} ft", px=4.8, color=C["muted"], ha="right", weight="bold")
+    card.text(x, base + 7, _hhmm(t0)[:5], px=4.6, color=C["faint"])
+    card.text(x + w, base + 7, _hhmm(t1)[:5], px=4.6, color=C["faint"], ha="right")
 
 
 # ------------------------------------------------------------------ map
@@ -498,7 +559,12 @@ def _map(card: Card, alert: Alert):
     sub = "  ·  ".join(b for b in bits if b)
     lw_ = max(card.measure(title, 7.8, "bold") + 12, card.measure(sub, 6, "bold") if sub else 0) + 18
     lh_ = 32 if sub else 20
-    lrect = _place_label(lw_, lh_, apx, apy, mw, mh, track_px + extra_px * 3, blocked)
+    ahead_px = []  # the projected path (drawn later): keep the label off it
+    if ac.heading is not None and ac.speed_kt and ac.speed_kt > 60 and not ac.on_ground:
+        for k in range(1, 9):
+            la, lo = geo.destination(pos[1], pos[0], ac.heading, ac.speed_kt * 1.852 / 6 * k / 8)
+            ahead_px.append(m.to_px(near(lo), la))
+    lrect = _place_label(lw_, lh_, apx, apy, mw, mh, track_px + extra_px * 3 + ahead_px * 3, blocked)
     blocked.append(lrect)
 
     # cities: biggest first, keep labels apart and off the aircraft, track, airports and overlays
@@ -569,6 +635,19 @@ def _map(card: Card, alert: Alert):
             stamp = datetime.fromtimestamp(p.ts if k == 0 else (p.ts // 3600) * 3600, timezone.utc).strftime("%H:%M")
             ax.plot([xy[k][0]], [xy[k][1]], "o", ms=2.6 * PT, color="#ffffff", alpha=0.7, mew=0, zorder=8.5)
             m.text(tx + 5, ty - 5, stamp, 5.2, C["muted"], z=8.5, alpha=0.9, path_effects=HALO)
+
+    # where it will be in 10 minutes if it holds this heading and speed
+    if ac.heading is not None and ac.speed_kt and ac.speed_kt > 60 and not ac.on_ground:
+        ahead_km = ac.speed_kt * 1.852 / 6
+        steps = [geo.destination(pos[1], pos[0], ac.heading, ahead_km * k / 8) for k in range(1, 9)]
+        fx = [P(near(lo), la)[0] for la, lo in steps]
+        fy = [P(near(lo), la)[1] for la, lo in steps]
+        ax.plot([P(*pos)[0]] + fx, [P(*pos)[1]] + fy, ls=(0, (1, 2.2)), lw=1.2 * PT, color="#ffffff", alpha=0.45, zorder=8.8,
+                dash_capstyle="round")
+        ex, ey = m.to_px(near(steps[-1][1]), steps[-1][0])
+        if 10 < ex < mw - 40 and 26 < ey < mh - 34 and math.hypot(ex - apx, ey - apy) > 26:
+            ax.plot([fx[-1]], [fy[-1]], "o", ms=2.4 * PT, mfc="none", mec="#ffffff", mew=0.8, alpha=0.6, zorder=8.8)
+            m.text(ex + 5, ey - 4, "+10 min", 4.8, C["muted"], z=8.8, alpha=0.9, path_effects=HALO)
 
     # aircraft: soft halo, shadow, icon
     px, py = P(*pos)
@@ -1126,3 +1205,112 @@ render_card = _locked(render_card)
 render_overview = _locked(render_overview)
 render_heatmap = _locked(render_heatmap)
 render_watched = _locked(render_watched)
+
+
+# ------------------------------------------------------------------ daily brief
+
+
+def _hbars(card: Card, x, y, w, heading, rows, color, max_rows=6):
+    """Horizontal bar list: rows of (label, value, sub). Returns the y below it."""
+    card.text(x, y, heading, px=5.4, color=C["faint"], weight="bold")
+    y += 12
+    top = max((r[1] for r in rows[:max_rows]), default=0) or 1
+    for label, value, sub in rows[:max_rows]:
+        card.text(x, y, textwrap.shorten(label, 34, placeholder="…"), px=6.6, weight="bold")
+        card.text(x + w, y, f"{value:,}" if isinstance(value, int) else f"{value:,.0f}", px=6.6, weight="bold", ha="right")
+        card.ov.add_patch(FancyBboxPatch((x, y + 4), w, 3.2, boxstyle="round,pad=0,rounding_size=1.6", fc="#ffffff", alpha=0.06, ec="none", zorder=5))
+        card.ov.add_patch(FancyBboxPatch((x, y + 4), max(3.2, w * value / top), 3.2, boxstyle="round,pad=0,rounding_size=1.6",
+                                         fc=color, alpha=0.9, ec="none", zorder=5.1))
+        if sub:
+            card.text(x, y + 15, textwrap.shorten(sub, 52, placeholder="…"), px=5, color=C["faint"])
+        y += 24 if sub else 17
+    if not rows:
+        card.text(x, y, "Nothing yet", px=6, color=C["faint"])
+        y += 14
+    return y
+
+
+def render_brief(summary: dict, path, period_label: str, title: str = "PLANE ALERT", brand: str = "plane watch",
+                 sample: bool = False, filter_label: str = ""):
+    """A one-picture briefing: the key numbers, what was found, activity by hour, busiest airfields, types and routes."""
+    accent = "#64d2ff"
+    card = Card(title, brand)
+    when = datetime.now(timezone.utc).strftime("%d %b %Y · %H:%M UTC")
+    card.chrome(accent, f"{summary.get('positions', 0):,} positions analysed · {period_label} · recorded by Plane Watch", when, sample,
+                subtitle="Military brief" + (f" · {filter_label}" if filter_label else ""))
+    # soft backdrop on the right so it doesn't look empty without a map
+    gx, gy = np.meshgrid(np.linspace(-1, 1, 160), np.linspace(-1, 1, 100))
+    card.image(_rgba("#1a2a3d", np.exp(-((gx * 0.9) ** 2 + (gy * 1.2) ** 2) * 1.6) * 0.55), PANEL_W - 40, 30, W, H - 10, z=1)
+
+    # ---- left: numbers and findings
+    x0, xr = 14, PANEL_W - 12
+    card.pill(x0 + 1, 54, f"MILITARY BRIEF · {period_label.upper()}", 6.3, "#0b0d10", accent)
+    card.text(x0, 90, f"{summary.get('aircraft_seen', 0):,}", px=21, weight="bold")
+    card.text(x0, 102, "aircraft seen", px=6.2, color=C["muted"])
+    prev = summary.get("previous") or {}
+    if prev.get("change_pct") is not None:
+        up = prev["change_pct"] >= 0
+        card.pill(xr, 84, f"{'▲' if up else '▼'} {abs(prev['change_pct'])}% vs before", 6, "#30d158" if up else "#ff9f0a",
+                  "#30d158" if up else "#ff9f0a", bg_alpha=0.16, ha="right")
+    tiles = [("FLIGHTS", f"{len(summary.get('flights', [])):,}"), ("HOURS", f"{summary.get('flight_hours', 0):,.0f}"),
+             ("AIRFIELDS", f"{len(summary.get('airfields', [])):,}")]
+    tw = (xr - x0 - 10) / 3
+    for k, (label, value) in enumerate(tiles):
+        tx = x0 + k * (tw + 5)
+        card.ov.add_patch(FancyBboxPatch((tx, 112), tw, 32, boxstyle="round,pad=0,rounding_size=5", fc="#ffffff", alpha=0.045, ec="none", zorder=5))
+        card.text(tx + 6, 122, label, px=4.8, color=C["faint"], weight="bold")
+        card.text(tx + 6, 137, value, px=10, weight="bold")
+    card.text(x0, 160, "KEY FINDINGS", px=5.4, color=C["faint"], weight="bold")
+    y = 173
+    for line in (summary.get("insights") or [])[1:]:
+        wrapped = textwrap.wrap(line, 47)
+        if y + len(wrapped) * 8.6 > H - FOOTER_H - 16:
+            break
+        card.ov.plot([x0 + 2], [y - 2.2], "o", ms=2.2 * PT, color=accent, mew=0, zorder=6)
+        for w_ in wrapped:
+            card.text(x0 + 9, y, w_, px=5.9, color="#d3d9df")
+            y += 8.6
+        y += 4.5
+
+    # ---- right top: activity by hour
+    cx0, cx1 = PANEL_W + 34, W - 22
+    card.text(cx0, 58, "AIRCRAFT AIRBORNE BY HOUR (UTC)", px=5.4, color=C["faint"], weight="bold")
+    hourly = summary.get("hourly") or []
+    base, top = 168, 70
+    if hourly:
+        peak = max(h["airborne"] for h in hourly) or 1
+        bw = (cx1 - cx0) / len(hourly)
+        for k, h in enumerate(hourly):
+            hgt = (base - top) * h["airborne"] / peak
+            if hgt > 0.4:
+                col = HEAT_CMAP(0.25 + 0.7 * h["airborne"] / peak)
+                card.ov.add_patch(FancyBboxPatch((cx0 + k * bw + bw * 0.14, base - hgt), bw * 0.72, hgt,
+                                                 boxstyle=f"round,pad=0,rounding_size={min(bw * 0.3, 2.2, hgt / 2)}", fc=col, ec="none",
+                                                 alpha=0.95, zorder=5))
+        dep_peak = max(h["departures"] for h in hourly) or 1
+        xs = [cx0 + (k + 0.5) * bw for k in range(len(hourly))]
+        ys = [base - (base - top) * 0.9 * h["departures"] / dep_peak for h in hourly]
+        card.ov.plot(xs, ys, color="#ffffff", alpha=0.75, lw=0.9 * PT, zorder=6, solid_joinstyle="round")
+        card.text(cx1, 58, f"bars: aircraft airborne (peak {peak})   ·   line: take-offs (peak {dep_peak})", px=5, color=C["muted"], ha="right")
+        step = max(1, len(hourly) // 8)
+        for k in range(0, len(hourly), step):
+            stamp = datetime.fromtimestamp(hourly[k]["ts"], timezone.utc)
+            card.text(cx0 + (k + 0.5) * bw, base + 9, stamp.strftime("%H:00" if len(hourly) <= 30 else "%d %b"), px=4.8, color=C["faint"], ha="center")
+    card.ov.plot([cx0, cx1], [base, base], color="#ffffff", alpha=0.12, lw=0.6, zorder=5)
+
+    # ---- right bottom: three lists
+    col_w = (cx1 - cx0 - 36) / 3
+    y0 = 200
+    _hbars(card, cx0, y0, col_w, "BUSIEST AIRFIELDS (MOVEMENTS)",
+           [(f"{a['icao']}  {a['name']}", a["movements"], f"{a['departures']} out · {a['arrivals']} in · {a['top_types']}")
+            for a in summary.get("airfields", [])], "#fd7a5c")
+    _hbars(card, cx0 + col_w + 18, y0, col_w, "MOST FLYING BY TYPE (HOURS)",
+           [(f"{t['type']}  {nice_desc(t['descr'])}", t["hours"], f"{t['flights']} flights · avg {t['avg_minutes']} min · {t['aircraft']} aircraft")
+            for t in sorted((t for t in summary.get("types", []) if t.get("flights")), key=lambda t: -t["hours"])], "#64d2ff")
+    _hbars(card, cx0 + 2 * (col_w + 18), y0, col_w, "TOP ROUTES (FLIGHTS)",
+           [(f"{r['from']} → {r['to']}", r["flights"], f"{r['km']:,} km · {r['types']}") for r in summary.get("routes", [])], "#bf5af2")
+    card.save(path)
+    return path
+
+
+render_brief = _locked(render_brief)

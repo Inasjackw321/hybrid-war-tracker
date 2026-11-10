@@ -27,7 +27,6 @@ from .models import Aircraft
 MIN_GAP_S = 120  # store at most one position per aircraft every 2 minutes (keeps a week of the military feed small)
 FLIGHT_GAP_S = 30 * 60  # a gap this long starts a new flight
 AIRFIELD_RADIUS_KM = 25  # a flight "starts/ends at" an airfield this close to its first/last point
-LOW_ALT_FT = 6000  # ...and only if it was low there (otherwise it appeared/disappeared en route)
 
 # ICAO type designators to keep an eye on (last position over the last 24 h)
 WATCH_TYPES = {
@@ -51,12 +50,18 @@ def _airfield_grid() -> dict:
     return grid
 
 
-_MAJOR_WORDS = ("air base", "afb", "nas ", "naval", "mcas", "army", "air force", "airfield", "field", "international", "base")
+_MILITARY_WORDS = ("air base", "afb", " nas ", "naval", "mcas", "army", "air force", " aaf", "air national guard", "joint base",
+                   "raf ", "air station", "nolf", "airbase", "military", "air reserve", " arb", " ab ", "marine corps")
+
+
+def _is_military_base(a: dict) -> bool:
+    name = " " + (a.get("name") or "").lower() + " "
+    return any(w in name for w in _MILITARY_WORDS)
 
 
 def _is_major(a: dict) -> bool:
-    name = (a.get("name") or "").lower() + " "
-    return bool(a.get("iata")) or any(w in name for w in _MAJOR_WORDS)
+    """A real airport (has an IATA code) or a military base, as opposed to a private strip or farm field."""
+    return bool(a.get("iata")) or _is_military_base(a)
 
 
 def nearest_airfield(lat: float, lon: float, radius_km: float = AIRFIELD_RADIUS_KM) -> tuple[dict | None, float]:
@@ -355,11 +360,129 @@ def split_flights(points: list[tuple]) -> list[list[tuple]]:
     return [f for f in flights if len(f) >= 2 and any(_airborne(q) for q in f)]
 
 
-def _end(lat, lon, alt) -> dict | None:
-    if alt is not None and alt > LOW_ALT_FT:
+# ---- where a flight started and ended
+#
+# Confirmed: the aircraft reported "on the ground" at an airfield.
+# Inferred: the signal started or stopped while it was low, close to an airfield, and climbing away from it /
+# descending towards it. Receivers lose aircraft below the horizon, so most real landings look like this.
+INFER_MAX_KM = 90  # never infer an airfield further away than this
+INFER_MAX_HEIGHT_FT = 12000  # ...or from higher above the field than this
+GLIDE_KM_PER_1000FT = 9.0  # a 3-degree approach covers ~6 km per 1000 ft; allow 1.5x for shallow/vectored approaches
+GROUND_RADIUS_KM = 25
+
+
+def airfields_within(lat: float, lon: float, radius_km: float) -> list[tuple[dict, float]]:
+    grid = _airfield_grid()
+    la, lo = math.floor(lat), math.floor(lon)
+    span = max(1, math.ceil(radius_km / (111.0 * max(0.2, math.cos(math.radians(lat))))))
+    out = []
+    for dy in (-1, 0, 1):
+        for dx in range(-span, span + 1):
+            for a in grid.get((la + dy, (lo + dx + 180) % 360 - 180), []):
+                d = geo.haversine_km(lat, lon, a["lat"], a["lon"])
+                if d <= radius_km:
+                    out.append((a, d))
+    return out
+
+
+def _bearing_deg(lat1, lon1, lat2, lon2) -> float:
+    return math.degrees(geo._bearing(lat1, lon1, lat2, lon2)) % 360
+
+
+def _angle_diff(a, b) -> float:
+    return abs((a - b + 180) % 360 - 180)
+
+
+def infer_end(points: list[tuple], which: str, military: bool = True) -> dict | None:
+    """The airfield a flight started from (which="start") or ended at ("end"), or None if it was en route.
+    Returns {"icao", "name", "country", "km", "how": "ground" | "inferred", "alt": ft at that moment}."""
+    p = points[0] if which == "start" else points[-1]
+    ts, lat, lon, alt = p
+
+    def pack(a, d, how):
+        return {"icao": a["icao"], "name": a["name"], "country": a.get("country", ""), "km": round(d, 1), "how": how,
+                "alt": alt, "lat": a["lat"], "lon": a["lon"]}
+
+    if alt == 0:  # reported on the ground
+        a, d = nearest_airfield(lat, lon, GROUND_RADIUS_KM)
+        return pack(a, d, "ground") if a else None
+
+    # the trend just after the start / just before the end
+    near = points[1:5] if which == "start" else points[-5:-1][::-1]
+    vrate = track = None
+    for q in near:
+        dt_min = abs(q[0] - ts) / 60
+        if dt_min < 0.5 or dt_min > 12:
+            continue
+        if alt is not None and q[3] is not None and vrate is None:
+            vrate = (q[3] - alt) / dt_min if which == "start" else (alt - q[3]) / dt_min  # ft/min, + = climbing over time
+        if track is None and geo.haversine_km(lat, lon, q[1], q[2]) > 0.5:
+            track = _bearing_deg(lat, lon, q[1], q[2]) if which == "start" else _bearing_deg(q[1], q[2], lat, lon)
+        if vrate is not None and track is not None:
+            break
+
+    best, best_score = None, 1e9
+    for a, d in airfields_within(lat, lon, INFER_MAX_KM):
+        height = (alt if alt is not None else 99999) - (a.get("elevation") or 0)
+        # allow a level stretch at approach altitude (15 km) plus the descent itself
+        if height > INFER_MAX_HEIGHT_FT or d > 15 + max(height, 0) / 1000 * GLIDE_KM_PER_1000FT:
+            continue
+        # must be heading the right way vertically (unless already very low)
+        if height > 1500:
+            if vrate is None:
+                if height > 4000:
+                    continue
+            elif (which == "end" and vrate > 300) or (which == "start" and vrate < -300):
+                continue
+        # ...and horizontally (unless it's right on top of the field)
+        off = 0.0
+        if track is not None and d > 12:
+            want = _bearing_deg(lat, lon, a["lat"], a["lon"]) if which == "end" else _bearing_deg(a["lat"], a["lon"], lat, lon)
+            off = _angle_diff(track, want)
+            if off > 70:
+                continue
+        major = _is_major(a)
+        if not major and (d > 10 or height > 2500):
+            continue  # a private strip only counts if the aircraft was very low and right next to it
+        # closer is better, but pointing straight at the field matters more than a few km, and a military
+        # aircraft is more likely going to a military base than to the civil airport next door
+        score = (d + (0 if major else 40)) * (1 + off / 30) * (0.75 if military and _is_military_base(a) else 1.0)
+        if score < best_score:
+            best, best_score = (a, d), score
+    return pack(best[0], best[1], "inferred") if best else None
+
+
+def loiter(points: list[tuple]) -> dict | None:
+    """Did this flight orbit / hold somewhere? Looks for 40-minute stretches at altitude where the aircraft flew a
+    long way but ended up close to where it began. Returns the centre and how long it stayed."""
+    if len(points) < 8:
         return None
-    a, d = nearest_airfield(lat, lon)
-    return {"icao": a["icao"], "name": a["name"], "country": a.get("country", ""), "km": round(d, 1)} if a else None
+    cum = [0.0]
+    for a, b in zip(points, points[1:]):
+        cum.append(cum[-1] + geo.haversine_km(a[1], a[2], b[1], b[2]))
+    flagged = [False] * len(points)
+    j = 0
+    for i in range(len(points)):
+        while j < len(points) - 1 and points[j][0] - points[i][0] < 40 * 60:
+            j += 1
+        if points[j][0] - points[i][0] < 35 * 60:
+            break
+        if min((q[3] or 0) for q in points[i:j + 1]) < 8000:
+            continue
+        path, disp = cum[j] - cum[i], geo.haversine_km(points[i][1], points[i][2], points[j][1], points[j][2])
+        if path > 150 and disp < path * 0.3 and disp < 120:
+            for k in range(i, j + 1):
+                flagged[k] = True
+    idx = [k for k, f in enumerate(flagged) if f]
+    if not idx:
+        return None
+    minutes = sum((points[k + 1][0] - points[k][0]) / 60 for k in idx[:-1] if flagged[k + 1] and points[k + 1][0] - points[k][0] < 900)
+    lat = sum(points[k][1] for k in idx) / len(idx)
+    lon = sum(points[k][2] for k in idx) / len(idx)
+    a, d = nearest_airfield(lat, lon, 150)
+    return {"lat": round(lat, 2), "lon": round(lon, 2), "minutes": round(minutes),
+            "alt": round(sum((points[k][3] or 0) for k in idx) / len(idx), -2),
+            "near": {"icao": a["icao"], "name": a["name"], "km": round(d)} if a else None}
 
 
 def flights(store: Store, since: float, info: dict | None = None, hex_code: str | None = None,
@@ -374,13 +497,24 @@ def flights(store: Store, since: float, info: dict | None = None, hex_code: str 
         for f in split_flights(pts):
             dist = sum(geo.haversine_km(a[1], a[2], b[1], b[2]) for a, b in zip(f, f[1:]))
             start, end = f[0], f[-1]
+            mil = bool(meta.get("military", True))
+            frm, to = infer_end(f, "start", mil), infer_end(f, "end", mil)
+            lo = loiter(f)
+            minutes = round((end[0] - start[0]) / 60)
+            if frm and to:
+                kind = "local" if frm["icao"] == to["icao"] else "transit"
+            elif frm or to:
+                kind = "partial"  # one end seen
+            else:
+                kind = "en route"  # passed through coverage
             out.append({
                 "hex": h, "callsign": meta.get("callsign") or "", "reg": meta.get("reg") or "", "type": meta.get("type") or "",
                 "descr": meta.get("descr") or "", "operator": meta.get("operator") or "",
-                "start_ts": start[0], "end_ts": end[0], "minutes": round((end[0] - start[0]) / 60),
+                "start_ts": start[0], "end_ts": end[0], "minutes": minutes,
                 "start_lat": round(start[1], 3), "start_lon": round(start[2], 3), "end_lat": round(end[1], 3), "end_lon": round(end[2], 3),
-                "from": _end(start[1], start[2], start[3]), "to": _end(end[1], end[2], end[3]),
+                "from": frm, "to": to, "kind": kind, "loiter": lo,
                 "max_alt": max((p[3] or 0) for p in f), "km": round(dist), "points": len(f),
+                "kmh": round(dist / (minutes / 60)) if minutes >= 5 else None,
             })
     if filt.airfield:
         a = filt.airfield.lower()
@@ -389,96 +523,277 @@ def flights(store: Store, since: float, info: dict | None = None, hex_code: str 
     return out
 
 
-def summarize(store: Store, since: float, filt: Filter | None = None) -> dict:
-    """Everything the dashboard's military section and the CSVs need, for one period (optionally filtered)."""
+def _top(counter: dict, n: int = 3) -> str:
+    return ", ".join(k for k, _ in sorted(counter.items(), key=lambda kv: -kv[1])[:n])
+
+
+def summarize(store: Store, since: float, filt: Filter | None = None, now: float | None = None) -> dict:
+    """Everything the dashboard's military section and the CSVs need, for one period (optionally filtered):
+    flights, airfields, routes, loitering, per-type and per-aircraft statistics, activity by hour, a comparison
+    with the period before, and a few plain-language findings."""
     filt = filt or NO_FILTER
+    now = now or time.time()
     info = store.aircraft_info()
     fl = flights(store, since, info, filt=filt)
     airfield_hexes = {f["hex"] for f in fl} if filt.airfield else None
+
+    # ---- airfields, with confirmed vs inferred movements and activity by hour of day (UTC)
     airfields: dict[str, dict] = {}
     for f in fl:
-        for key, kind in (("from", "departures"), ("to", "arrivals")):
+        for key, kind, ts in (("from", "departures", f["start_ts"]), ("to", "arrivals", f["end_ts"])):
             a = f[key]
             if not a:
                 continue
-            row = airfields.setdefault(a["icao"], {"icao": a["icao"], "name": a["name"], "country": a["country"],
-                                                   "departures": 0, "arrivals": 0, "aircraft": set(), "types": {}})
+            row = airfields.setdefault(a["icao"], {
+                "icao": a["icao"], "name": a["name"], "country": a["country"], "lat": a["lat"], "lon": a["lon"], "departures": 0,
+                "arrivals": 0, "inferred": 0, "aircraft": set(), "types": {}, "links": {}, "by_hour": [0] * 24})
             row[kind] += 1
+            row["inferred"] += a["how"] == "inferred"
             row["aircraft"].add(f["hex"])
+            row["by_hour"][int(ts // 3600) % 24] += 1
             if f["type"]:
                 row["types"][f["type"]] = row["types"].get(f["type"], 0) + 1
+            other = f["to" if key == "from" else "from"]
+            if other and other["icao"] != a["icao"]:
+                row["links"][other["icao"]] = row["links"].get(other["icao"], 0) + 1
     airfield_rows = []
     for r in airfields.values():
         r["unique_aircraft"] = len(r.pop("aircraft"))
-        r["top_types"] = ", ".join(t for t, _ in sorted(r.pop("types").items(), key=lambda kv: -kv[1])[:3])
+        r["top_types"] = _top(r.pop("types"))
+        r["top_links"] = _top(r.pop("links"))
         r["movements"] = r["departures"] + r["arrivals"]
+        r["peak_hour"] = max(range(24), key=lambda h: r["by_hour"][h])
         airfield_rows.append(r)
     airfield_rows.sort(key=lambda r: -r["movements"])
 
+    # ---- routes between two different airfields
+    routes: dict[tuple, dict] = {}
+    for f in fl:
+        if f["kind"] != "transit":
+            continue
+        key = (f["from"]["icao"], f["to"]["icao"])
+        r = routes.setdefault(key, {"from": f["from"]["icao"], "from_name": f["from"]["name"], "to": f["to"]["icao"],
+                                    "to_name": f["to"]["name"], "flights": 0, "aircraft": set(), "types": {}, "minutes": 0,
+                                    "km": round(geo.haversine_km(f["from"]["lat"], f["from"]["lon"], f["to"]["lat"], f["to"]["lon"]))})
+        r["flights"] += 1
+        r["aircraft"].add(f["hex"])
+        r["minutes"] += f["minutes"]
+        if f["type"]:
+            r["types"][f["type"]] = r["types"].get(f["type"], 0) + 1
+    route_rows = []
+    for r in routes.values():
+        r["aircraft"] = len(r["aircraft"])
+        r["types"] = _top(r["types"])
+        r["avg_minutes"] = round(r.pop("minutes") / r["flights"])
+        route_rows.append(r)
+    route_rows.sort(key=lambda r: (-r["flights"], -r["km"]))
+
+    # ---- who was seen
     seen = {h: m for h, m in info.items() if m["military"] and (m["last_seen"] or 0) >= since and filt.match_meta(m)
             and (airfield_hexes is None or h in airfield_hexes)}
     types: dict[str, dict] = {}
     operators: dict[str, int] = {}
     for m in seen.values():
         t = m["type"] or "?"
-        row = types.setdefault(t, {"type": t, "descr": m["descr"] or "", "aircraft": 0})
+        row = types.setdefault(t, {"type": t, "descr": m["descr"] or "", "aircraft": 0, "flights": 0, "minutes": 0, "km": 0,
+                                   "max_alt": 0, "loiter_minutes": 0, "airfields": {}})
         row["aircraft"] += 1
         if m["operator"]:
             operators[m["operator"]] = operators.get(m["operator"], 0) + 1
-    per_aircraft = {}
+    new_aircraft = sorted((m for m in seen.values() if (m["first_seen"] or 0) >= now - 86400 and (m["first_seen"] or 0) > since + 3600),
+                          key=lambda m: -(m["first_seen"] or 0))
+
+    # ---- per type and per aircraft
+    per_aircraft: dict[str, dict] = {}
+    kinds: dict[str, int] = {}
+    ends = {"ground": 0, "inferred": 0, "unknown": 0}
+    loiters = []
     for f in fl:
+        kinds[f["kind"]] = kinds.get(f["kind"], 0) + 1
+        for key in ("from", "to"):
+            ends[f[key]["how"] if f[key] else "unknown"] += 1
+        t = types.setdefault(f["type"] or "?", {"type": f["type"] or "?", "descr": f["descr"], "aircraft": 0, "flights": 0, "minutes": 0,
+                                                "km": 0, "max_alt": 0, "loiter_minutes": 0, "airfields": {}})
+        t["flights"] += 1
+        t["minutes"] += f["minutes"]
+        t["km"] += f["km"]
+        t["max_alt"] = max(t["max_alt"], f["max_alt"])
         r = per_aircraft.setdefault(f["hex"], {"hex": f["hex"], "callsign": f["callsign"], "reg": f["reg"], "type": f["type"],
-                                               "operator": f["operator"], "flights": 0, "km": 0, "airfields": set()})
+                                               "operator": f["operator"], "flights": 0, "km": 0, "minutes": 0, "airfields": {},
+                                               "loiter_minutes": 0, "last_ts": 0, "last_airfield": ""})
         r["flights"] += 1
         r["km"] += f["km"]
+        r["minutes"] += f["minutes"]
+        if f["end_ts"] > r["last_ts"]:
+            r["last_ts"], r["last_airfield"] = f["end_ts"], (f["to"] or {}).get("icao", "")
         for key in ("from", "to"):
             if f[key]:
-                r["airfields"].add(f[key]["icao"])
+                r["airfields"][f[key]["icao"]] = r["airfields"].get(f[key]["icao"], 0) + 1
+                t["airfields"][f[key]["icao"]] = t["airfields"].get(f[key]["icao"], 0) + 1
+        if f["loiter"]:
+            lo = f["loiter"]
+            r["loiter_minutes"] += lo["minutes"]
+            t["loiter_minutes"] += lo["minutes"]
+            loiters.append({"hex": f["hex"], "callsign": f["callsign"], "type": f["type"], "operator": f["operator"],
+                            "start_ts": f["start_ts"], "minutes": lo["minutes"], "alt": lo["alt"], "lat": lo["lat"], "lon": lo["lon"],
+                            "near": lo["near"], "from": f["from"], "to": f["to"]})
     aircraft_rows = []
     for r in per_aircraft.values():
+        r["home"] = max(r["airfields"], key=r["airfields"].get) if r["airfields"] else ""  # the airfield it used most
         r["airfields"] = ", ".join(sorted(r["airfields"]))
+        r["hours"] = round(r.pop("minutes") / 60, 1)
         aircraft_rows.append(r)
     aircraft_rows.sort(key=lambda r: -r["km"])
-    return {
+    type_rows = []
+    for t in types.values():
+        t["hours"] = round(t["minutes"] / 60, 1)
+        t["avg_minutes"] = round(t.pop("minutes") / t["flights"]) if t["flights"] else 0
+        t["avg_km"] = round(t["km"] / t["flights"]) if t["flights"] else 0
+        t["top_airfields"] = _top(t.pop("airfields"))
+        type_rows.append(t)
+    type_rows.sort(key=lambda r: (-r["aircraft"], -r["flights"]))
+    loiters.sort(key=lambda r: -r["minutes"])
+
+    # ---- activity over time, and against the period before
+    clause, params = store._filter_sql(filt, airfield_hexes)
+    hourly_air = dict(store.db.execute(
+        "SELECT CAST(p.ts / 3600 AS INTEGER), COUNT(DISTINCT p.hex) FROM pos p JOIN ac ON ac.hex = p.hex AND ac.military = 1 "
+        "WHERE p.ts >= ?" + clause + " GROUP BY 1", (since, *params)).fetchall())
+    dep_by_hour: dict[int, int] = {}
+    for f in fl:
+        if f["from"]:
+            dep_by_hour[int(f["start_ts"] // 3600)] = dep_by_hour.get(int(f["start_ts"] // 3600), 0) + 1
+    hourly = [{"ts": h * 3600, "airborne": hourly_air.get(h, 0), "departures": dep_by_hour.get(h, 0)}
+              for h in range(int(since // 3600), int(now // 3600) + 1)]
+    span = now - since
+    first_ts = store.db.execute("SELECT MIN(ts) FROM pos").fetchone()[0]
+    previous = None
+    if first_ts is not None and first_ts <= since - span * 0.9:  # only compare if the earlier period was fully recorded
+        prev_aircraft, prev_positions = store.db.execute(
+            "SELECT COUNT(DISTINCT p.hex), COUNT(*) FROM pos p JOIN ac ON ac.hex = p.hex AND ac.military = 1 "
+            "WHERE p.ts >= ? AND p.ts < ?" + clause, (since - span, since, *params)).fetchone()
+        active_now = store.db.execute(
+            "SELECT COUNT(DISTINCT p.hex) FROM pos p JOIN ac ON ac.hex = p.hex AND ac.military = 1 WHERE p.ts >= ?" + clause,
+            (since, *params)).fetchone()[0]
+        previous = {"aircraft": prev_aircraft, "positions": prev_positions, "aircraft_now": active_now,
+                    "change_pct": round((active_now - prev_aircraft) / prev_aircraft * 100) if prev_aircraft else None}
+
+    out = {
         "since": since,
         "positions": store.count_positions(since, filt, airfield_hexes),
         "hexes": airfield_hexes,
         "aircraft_seen": len(seen),
         "flights": fl,
         "airfields": airfield_rows,
-        "types": sorted(types.values(), key=lambda r: -r["aircraft"]),
+        "routes": route_rows,
+        "loiters": loiters,
+        "types": type_rows,
         "operators": [{"operator": k, "aircraft": v} for k, v in sorted(operators.items(), key=lambda kv: -kv[1])],
         "aircraft": aircraft_rows,
+        "kinds": kinds,
+        "ends": ends,
+        "hourly": hourly,
+        "previous": previous,
+        "new_aircraft": [{"hex": m["hex"], "callsign": m["callsign"] or "", "type": m["type"] or "", "descr": m["descr"] or "",
+                          "operator": m["operator"] or "", "first_seen": m["first_seen"]} for m in new_aircraft[:100]],
+        "flight_hours": round(sum(f["minutes"] for f in fl) / 60, 1),
     }
+    out["insights"] = insights(out)
+    return out
+
+
+def insights(s: dict) -> list[str]:
+    """A few plain-language findings from a summary, most important first."""
+    out = []
+    fl = s["flights"]
+    if not fl and not s["aircraft_seen"]:
+        return ["Nothing recorded for this period yet."]
+    out.append(f"{s['aircraft_seen']:,} military aircraft seen, flying {len(fl):,} flights and {s['flight_hours']:,.0f} hours.")
+    p = s.get("previous")
+    if p and p.get("change_pct") is not None:
+        word = "up" if p["change_pct"] > 0 else "down" if p["change_pct"] < 0 else "level"
+        out.append(f"Activity is {word} {abs(p['change_pct'])}% on the period before ({p['aircraft_now']} aircraft vs {p['aircraft']})."
+                   if word != "level" else f"Activity is level with the period before ({p['aircraft']} aircraft).")
+    if s["airfields"]:
+        a = s["airfields"][0]
+        out.append(f"Busiest airfield: {a['icao']} {a['name']} with {a['movements']} movements ({a['departures']} out, {a['arrivals']} in), "
+                   f"mostly {a['top_types'] or 'mixed types'}; busiest around {a['peak_hour']:02d}:00 UTC.")
+    if s["routes"]:
+        r = s["routes"][0]
+        out.append(f"Most flown route: {r['from']} → {r['to']} ({r['flights']} flights, about {r['km']:,} km, {r['types'] or 'mixed types'}).")
+    flown = [t for t in s["types"] if t["flights"]]
+    if flown:
+        t = max(flown, key=lambda t: t["hours"])
+        out.append(f"Most flying by type: {t['type']} with {t['hours']:,.0f} hours over {t['flights']} flights "
+                   f"(average {t['avg_minutes']} min, {t['avg_km']:,} km).")
+    if s["loiters"]:
+        lo = s["loiters"][0]
+        where = f"near {lo['near']['icao']}" if lo["near"] else f"around {lo['lat']}, {lo['lon']}"
+        n = len(s["loiters"])
+        out.append(f"{n} flight{'s' if n != 1 else ''} orbited or held. Longest: {lo['callsign'] or lo['hex']} ({lo['type']}) for "
+                   f"{lo['minutes']} min at about {lo['alt']:,.0f} ft {where}.")
+    k = s["kinds"]
+    if fl:
+        out.append(f"Flight mix: {k.get('transit', 0)} between airfields, {k.get('local', 0)} local (out and back), "
+                   f"{k.get('partial', 0)} with one end seen, {k.get('en route', 0)} passing through coverage.")
+    e = s["ends"]
+    known = e["ground"] + e["inferred"]
+    if known:
+        out.append(f"Take-offs and landings: {e['ground']} confirmed on the ground, {e['inferred']} inferred from a low approach or "
+                   f"climb-out where the signal started or stopped.")
+    peak = max(s["hourly"], key=lambda h: h["airborne"], default=None)
+    if peak and peak["airborne"]:
+        from datetime import datetime, timezone
+
+        out.append(f"Peak hour: {datetime.fromtimestamp(peak['ts'], timezone.utc).strftime('%d %b %H:00')} UTC with "
+                   f"{peak['airborne']} aircraft airborne.")
+    if s["new_aircraft"]:
+        out.append(f"{len(s['new_aircraft'])} aircraft seen for the first time in the last 24 hours.")
+    return out
 
 
 def write_csvs(summary: dict, folder: Path, suffix: str):
-    """military_flights_<suffix>.csv, military_airfields_<suffix>.csv, military_aircraft_<suffix>.csv"""
+    """military_{flights,airfields,aircraft,routes,types,loiters}_<suffix>.csv"""
     from datetime import datetime, timezone
 
     def iso(ts):
         return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d %H:%M") if ts else ""
 
+    def write(name, header, rows):
+        with (folder / f"military_{name}_{suffix}.csv").open("w", newline="", encoding="utf-8") as fh:
+            w = csv.writer(fh)
+            w.writerow(header)
+            w.writerows(rows)
+
     folder.mkdir(parents=True, exist_ok=True)
-    with (folder / f"military_flights_{suffix}.csv").open("w", newline="", encoding="utf-8") as fh:
-        w = csv.writer(fh)
-        w.writerow(["start_utc", "end_utc", "minutes", "hex", "callsign", "reg", "type", "operator", "from_icao", "from_name",
-                    "to_icao", "to_name", "start_lat", "start_lon", "end_lat", "end_lon", "km", "max_alt_ft"])
-        for f in summary["flights"]:
-            fr, to = f["from"] or {}, f["to"] or {}
-            w.writerow([iso(f["start_ts"]), iso(f["end_ts"]), f["minutes"], f["hex"], f["callsign"], f["reg"], f["type"], f["operator"],
-                        fr.get("icao", ""), fr.get("name", ""), to.get("icao", ""), to.get("name", ""),
-                        f["start_lat"], f["start_lon"], f["end_lat"], f["end_lon"], f["km"], f["max_alt"]])
-    with (folder / f"military_airfields_{suffix}.csv").open("w", newline="", encoding="utf-8") as fh:
-        w = csv.writer(fh)
-        w.writerow(["icao", "name", "country", "movements", "departures", "arrivals", "unique_aircraft", "top_types"])
-        for r in summary["airfields"]:
-            w.writerow([r["icao"], r["name"], r["country"], r["movements"], r["departures"], r["arrivals"], r["unique_aircraft"], r["top_types"]])
-    with (folder / f"military_aircraft_{suffix}.csv").open("w", newline="", encoding="utf-8") as fh:
-        w = csv.writer(fh)
-        w.writerow(["hex", "callsign", "reg", "type", "operator", "flights", "km", "airfields"])
-        for r in summary["aircraft"]:
-            w.writerow([r["hex"], r["callsign"], r["reg"], r["type"], r["operator"], r["flights"], r["km"], r["airfields"]])
+    rows = []
+    for f in summary["flights"]:
+        fr, to, lo = f["from"] or {}, f["to"] or {}, f.get("loiter") or {}
+        rows.append([iso(f["start_ts"]), iso(f["end_ts"]), f["minutes"], f["hex"], f["callsign"], f["reg"], f["type"], f["operator"],
+                     f.get("kind", ""), fr.get("icao", ""), fr.get("name", ""), fr.get("how", ""), to.get("icao", ""), to.get("name", ""),
+                     to.get("how", ""), f["start_lat"], f["start_lon"], f["end_lat"], f["end_lon"], f["km"], f["max_alt"],
+                     f.get("kmh") or "", lo.get("minutes", ""), lo.get("lat", ""), lo.get("lon", "")])
+    write("flights", ["start_utc", "end_utc", "minutes", "hex", "callsign", "reg", "type", "operator", "kind", "from_icao", "from_name",
+                      "from_how", "to_icao", "to_name", "to_how", "start_lat", "start_lon", "end_lat", "end_lon", "km", "max_alt_ft",
+                      "avg_kmh", "loiter_minutes", "loiter_lat", "loiter_lon"], rows)
+    write("airfields", ["icao", "name", "country", "movements", "departures", "arrivals", "inferred_movements", "unique_aircraft",
+                        "top_types", "top_links", "peak_hour_utc"],
+          [[r["icao"], r["name"], r["country"], r["movements"], r["departures"], r["arrivals"], r.get("inferred", ""), r["unique_aircraft"],
+            r["top_types"], r.get("top_links", ""), r.get("peak_hour", "")] for r in summary["airfields"]])
+    write("aircraft", ["hex", "callsign", "reg", "type", "operator", "flights", "hours", "km", "home_airfield", "last_airfield",
+                       "loiter_minutes", "airfields"],
+          [[r["hex"], r["callsign"], r["reg"], r["type"], r["operator"], r["flights"], r.get("hours", ""), r["km"], r.get("home", ""),
+            r.get("last_airfield", ""), r.get("loiter_minutes", ""), r["airfields"]] for r in summary["aircraft"]])
+    write("routes", ["from_icao", "from_name", "to_icao", "to_name", "flights", "aircraft", "types", "km", "avg_minutes"],
+          [[r["from"], r["from_name"], r["to"], r["to_name"], r["flights"], r["aircraft"], r["types"], r["km"], r["avg_minutes"]]
+           for r in summary.get("routes", [])])
+    write("types", ["type", "description", "aircraft", "flights", "hours", "avg_minutes", "avg_km", "max_alt_ft", "loiter_minutes",
+                    "top_airfields"],
+          [[t["type"], t["descr"], t["aircraft"], t.get("flights", ""), t.get("hours", ""), t.get("avg_minutes", ""), t.get("avg_km", ""),
+            t.get("max_alt", ""), t.get("loiter_minutes", ""), t.get("top_airfields", "")] for t in summary.get("types", [])])
+    write("loiters", ["start_utc", "hex", "callsign", "type", "operator", "minutes", "alt_ft", "lat", "lon", "near_icao", "near_km"],
+          [[iso(r["start_ts"]), r["hex"], r["callsign"], r["type"], r["operator"], r["minutes"], r["alt"], r["lat"], r["lon"],
+            (r["near"] or {}).get("icao", ""), (r["near"] or {}).get("km", "")] for r in summary.get("loiters", [])])
 
 
 def aircraft_report(db_path: Path, hex_code: str, days: float = 7) -> dict:

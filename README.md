@@ -124,6 +124,25 @@ While it runs, Plane Watch records every military aircraft the feeds report (one
 - **A file:** `python planewatch.pyz --acars-file acars.jsonl`
 - **airframes.io:** set the environment variable `AIRFRAMES_API_KEY` before you start the app.
 
+### Take-offs, landings and flight analysis
+
+Receivers lose aircraft when they drop below the horizon, so most real landings never show an "on the ground" position. Plane Watch handles both cases:
+
+- **Confirmed:** the aircraft reported being on the ground at an airfield.
+- **Inferred:** the signal started or stopped while the aircraft was low, close to an airfield, and climbing away from it or descending toward it. The allowed distance grows with height (a normal approach covers about 6 km per 1,000 ft), it has to be heading roughly at the field, real airports and military bases win over private strips, and a military aircraft is assumed to prefer a military base. Inferred ends are tagged **inferred** in the tables and CSVs, with the distance and altitude where the signal was lost. An aircraft that disappears at cruise altitude is left as "en route".
+
+From the flights it works out:
+
+- **Flight kind:** transit (between two airfields), local (out and back), partial (one end seen), en route (passing through coverage).
+- **Orbits and holds:** flights that stay in one area at altitude for 40 minutes or more (tankers, surveillance, holding), with the centre, altitude and time on station.
+- **Routes:** airfield pairs with flight counts, distance and average time.
+- **Airfields:** departures and arrivals, how many are inferred, peak hour, linked airfields, main types. Click one for its detail view: movements by hour of day, links, types, aircraft likely based there, recent flights.
+- **Types:** aircraft, flights, hours, average duration and distance, highest altitude, orbit time, main airfields.
+- **Aircraft:** flights, hours, distance, home airfield (the one it uses most), last airfield.
+- **Activity over time:** aircraft airborne and take-offs per hour, and the change against the period before (once that period has been recorded).
+- **New today:** aircraft seen for the first time in the last 24 hours.
+- **Analyst brief:** plain-language findings at the top of the Military section, and a shareable **brief graphic** (`cards/brief-24h.png`, `brief-7d.png`).
+
 ### Filters
 
 The **Military activity** section has a filter bar:
@@ -163,6 +182,8 @@ Everything goes in `planewatch-data/` (change it with `--out`):
 | `cards/watched-24h.png` | Ospreys and H-60s, last 24 hours |
 | `data/military_flights_24h.csv`, `_7d.csv` | every military flight: start, end, from and to airfield, distance |
 | `data/military_airfields_*.csv`, `military_aircraft_*.csv` | busiest airfields; per-aircraft totals |
+| `data/military_routes_*.csv`, `military_types_*.csv`, `military_loiters_*.csv` | route pairs; per-type statistics; orbits and holds |
+| `cards/brief-24h.png`, `brief-7d.png` | the military brief graphic |
 
 ## Options
 
